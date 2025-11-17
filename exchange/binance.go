@@ -43,13 +43,6 @@ type BinanceResponse struct {
 	Message string `json:"msg,omitempty"`
 }
 
-// Balance represents an asset balance
-type Balance struct {
-	Asset  string `json:"asset"`
-	Free   string `json:"free"`
-	Locked string `json:"locked"`
-}
-
 // BinanceOrderResponse represents the payload returned by the cancel order endpoints.
 // https://developers.binance.com/docs/binance-spot-api-docs/rest-api#cancel-order-trade
 type BinanceOrderResponse struct {
@@ -75,13 +68,6 @@ type BinanceOrderResponse struct {
 	StopPrice               string `json:"stopPrice,omitempty"`
 	IsWorking               bool   `json:"isWorking,omitempty"`
 	Time                    int64  `json:"time,omitempty"`
-}
-
-// TradingPair represents a trading pair
-type TradingPair struct {
-	Symbol     string
-	BaseAsset  string
-	QuoteAsset string
 }
 
 // BinanceStreamType represents WebSocket stream types

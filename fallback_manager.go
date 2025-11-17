@@ -1,4 +1,4 @@
-package exchange
+package goexchange
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/evdnx/goexchange/internal/logutil"
 	"github.com/evdnx/goexchange/models"
 	"github.com/evdnx/golog"
 )
@@ -92,7 +93,7 @@ func NewFallbackManager(config FallbackConfig, healthChecker HealthChecker) *Fal
 		exchanges:     make(map[string]Exchange),
 		healthInfo:    make(map[string]*ExchangeHealthInfo),
 		config:        config,
-		logger:        defaultLogger(),
+		logger:        logutil.Default(),
 		healthChecker: healthChecker,
 		ctx:           ctx,
 		cancel:        cancel,

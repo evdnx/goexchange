@@ -1,4 +1,4 @@
-package exchange
+package goexchange
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/evdnx/goexchange/cache"
+	"github.com/evdnx/goexchange/exchange"
+	"github.com/evdnx/goexchange/internal/logutil"
 	"github.com/evdnx/goexchange/models"
 	"github.com/evdnx/golog"
 	"github.com/evdnx/gowscl"
@@ -55,9 +57,9 @@ func (f *ExchangeFactory) RegisterExchange(config ExchangeConfig) {
 func (f *ExchangeFactory) CreateExchangeClient(config ExchangeConfig) (ExchangeClient, error) {
 	switch config.Type {
 	case ExchangeBinance:
-		return NewBinanceClient(config.APIKey, config.APISecret, config.Testnet, nil), nil
+		return exchange.NewBinanceClient(config.APIKey, config.APISecret, config.Testnet, nil), nil
 	case ExchangeCoinbase:
-		return NewCoinbaseClient(config.APIKey, config.APISecret, "", config.Testnet, nil), nil
+		return exchange.NewCoinbaseClient(config.APIKey, config.APISecret, "", config.Testnet, nil), nil
 	default:
 		return nil, fmt.Errorf("unsupported exchange type: %s", config.Type)
 	}
@@ -178,7 +180,7 @@ const exchangeFactoryComponent = "exchange_factory"
 
 // NewResilientExchangeFactory creates a new resilient exchange factory
 func NewResilientExchangeFactory(healthChecker HealthChecker) *ResilientExchangeFactory {
-	logger := defaultLogger()
+	logger := logutil.Default()
 	fallbackConfig := DefaultFallbackConfig()
 	fallbackManager := NewFallbackManager(fallbackConfig, healthChecker)
 	unifiedClient := NewUnifiedClient(fallbackManager)

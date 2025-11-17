@@ -4,6 +4,18 @@ import (
 	"time"
 )
 
+// TimeInForce represents the time in force of an order
+type TimeInForce string
+
+const (
+	// TimeInForceGTC represents Good Till Canceled
+	TimeInForceGTC TimeInForce = "GTC"
+	// TimeInForceIOC represents Immediate Or Cancel
+	TimeInForceIOC TimeInForce = "IOC"
+	// TimeInForceFOK represents Fill Or Kill
+	TimeInForceFOK TimeInForce = "FOK"
+)
+
 // OrderSide represents the side of an order (buy or sell)
 type OrderSide string
 
@@ -95,4 +107,18 @@ type Order struct {
 	// Adding Quantity for backward compatibility
 	Quantity  float64   `json:"quantity"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// Balance represents an asset balance
+type Balance struct {
+	Asset  string `json:"asset"`
+	Free   string `json:"free"`
+	Locked string `json:"locked"`
+}
+
+// TradingPair represents a trading pair
+type TradingPair struct {
+	Symbol     string
+	BaseAsset  string
+	QuoteAsset string
 }
