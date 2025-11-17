@@ -52,7 +52,7 @@ func (f *ExchangeFactory) RegisterExchange(config ExchangeConfig) {
 }
 
 // CreateExchangeClient creates an exchange client based on the configuration
-func (f *ExchangeFactory) CreateExchangeClient(config ExchangeConfig) (Client, error) {
+func (f *ExchangeFactory) CreateExchangeClient(config ExchangeConfig) (ExchangeClient, error) {
 	switch config.Type {
 	case ExchangeBinance:
 		return NewBinanceClient(config.APIKey, config.APISecret, config.Testnet, nil), nil
@@ -64,11 +64,11 @@ func (f *ExchangeFactory) CreateExchangeClient(config ExchangeConfig) (Client, e
 }
 
 // GetAllExchangeClients returns clients for all registered exchanges
-func (f *ExchangeFactory) GetAllExchangeClients() (map[ExchangeType]Client, error) {
+func (f *ExchangeFactory) GetAllExchangeClients() (map[ExchangeType]ExchangeClient, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	clients := make(map[ExchangeType]Client)
+	clients := make(map[ExchangeType]ExchangeClient)
 	for exchangeType, config := range f.configs {
 		client, err := f.CreateExchangeClient(config)
 		if err != nil {
@@ -101,27 +101,27 @@ func GetExchangeCapabilities(exchangeType ExchangeType) []ExchangeCapability {
 	}
 }
 
-// CreateCapableClient wraps a client with capability metadata.
-func (f *ExchangeFactory) CreateCapableClient(config ExchangeConfig) (CapableClient, error) {
+// CreateClient wraps a client with capability metadata.
+func (f *ExchangeFactory) CreateClient(config ExchangeConfig) (Client, error) {
 	client, err := f.CreateExchangeClient(config)
 	if err != nil {
 		return nil, err
 	}
 	capabilities := GetExchangeCapabilities(config.Type)
 	var wsClient *gowscl.Client
-	return NewBaseCapableClient(client, capabilities, wsClient), nil
+	return NewClient(client, capabilities, wsClient), nil
 }
 
-// GetAllCapableClients returns capable clients for all registered exchanges
-func (f *ExchangeFactory) GetAllCapableClients() (map[ExchangeType]CapableClient, error) {
+// GetAllClients returns clients for all registered exchanges
+func (f *ExchangeFactory) GetAllClients() (map[ExchangeType]Client, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	clients := make(map[ExchangeType]CapableClient)
+	clients := make(map[ExchangeType]Client)
 	for exchangeType, config := range f.configs {
-		client, err := f.CreateCapableClient(config)
+		client, err := f.CreateClient(config)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create capable client for %s: %w", exchangeType, err)
+			return nil, fmt.Errorf("failed to create client for %s: %w", exchangeType, err)
 		}
 		clients[exchangeType] = client
 	}

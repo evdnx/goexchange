@@ -48,8 +48,8 @@ func defaultLogger() *golog.Logger {
 	return sharedLogger
 }
 
-// Client defines the interface for an exchange client
-type Client interface {
+// ExchangeClient defines the interface for an exchange client
+type ExchangeClient interface {
 	GetName() string
 	GetTradingPairs() ([]TradingPair, error)
 	GetTicker(symbol string) (*models.Ticker, error)
@@ -100,9 +100,9 @@ type AccountInfo struct {
 	TakerCommission float64
 }
 
-// CapableClient extends the basic Client interface with additional capabilities
-type CapableClient interface {
-	Client
+// Client extends the basic ExchangeClient interface with additional capabilities
+type Client interface {
+	ExchangeClient
 
 	// HasCapability checks if the exchange has a specific capability
 	HasCapability(capability ExchangeCapability) bool
@@ -132,20 +132,20 @@ type CapableClient interface {
 	Transfer(asset string, amount float64, fromAccount, toAccount string) error
 
 	// WithContext returns a new client with the given context
-	WithContext(ctx context.Context) CapableClient
+	WithContext(ctx context.Context) Client
 }
 
-// BaseCapableClient provides common functionality for capable exchange clients
-type BaseCapableClient struct {
-	client       Client
+// DefaultClient provides common functionality for exchange clients
+type DefaultClient struct {
+	client       ExchangeClient
 	capabilities []ExchangeCapability
 	wsClient     *gowscl.Client
 	ctx          context.Context
 }
 
-// NewBaseCapableClient creates a new base capable client
-func NewBaseCapableClient(client Client, capabilities []ExchangeCapability, wsClient *gowscl.Client) *BaseCapableClient {
-	return &BaseCapableClient{
+// NewClient creates a new client wrapper with capability metadata
+func NewClient(client ExchangeClient, capabilities []ExchangeCapability, wsClient *gowscl.Client) *DefaultClient {
+	return &DefaultClient{
 		client:       client,
 		capabilities: capabilities,
 		wsClient:     wsClient,
@@ -154,72 +154,72 @@ func NewBaseCapableClient(client Client, capabilities []ExchangeCapability, wsCl
 }
 
 // GetName delegates to the embedded client
-func (c *BaseCapableClient) GetName() string {
+func (c *DefaultClient) GetName() string {
 	return c.client.GetName()
 }
 
 // GetTicker delegates to the embedded client
-func (c *BaseCapableClient) GetTicker(symbol string) (*models.Ticker, error) {
+func (c *DefaultClient) GetTicker(symbol string) (*models.Ticker, error) {
 	return c.client.GetTicker(symbol)
 }
 
 // CreateOrder delegates to the embedded client
-func (c *BaseCapableClient) CreateOrder(symbol string, side OrderSide, orderType OrderType, amount float64, price float64) (*Order, error) {
+func (c *DefaultClient) CreateOrder(symbol string, side OrderSide, orderType OrderType, amount float64, price float64) (*Order, error) {
 	return c.client.CreateOrder(symbol, side, orderType, amount, price)
 }
 
 // CancelOrder delegates to the embedded client
-func (c *BaseCapableClient) CancelOrder(symbol string, orderID string) error {
+func (c *DefaultClient) CancelOrder(symbol string, orderID string) error {
 	return c.client.CancelOrder(symbol, orderID)
 }
 
 // GetOrder delegates to the embedded client
-func (c *BaseCapableClient) GetOrder(symbol string, orderID string) (*Order, error) {
+func (c *DefaultClient) GetOrder(symbol string, orderID string) (*Order, error) {
 	return c.client.GetOrder(symbol, orderID)
 }
 
 // GetOrders delegates to the embedded client
-func (c *BaseCapableClient) GetOrders(symbol string, since time.Time, limit int) ([]Order, error) {
+func (c *DefaultClient) GetOrders(symbol string, since time.Time, limit int) ([]Order, error) {
 	return c.client.GetOrders(symbol, since, limit)
 }
 
 // GetBalance delegates to the embedded client
-func (c *BaseCapableClient) GetBalance(asset string) (*Balance, error) {
+func (c *DefaultClient) GetBalance(asset string) (*Balance, error) {
 	return c.client.GetBalance(asset)
 }
 
 // GetBalances delegates to the embedded client
-func (c *BaseCapableClient) GetBalances() (map[string]*Balance, error) {
+func (c *DefaultClient) GetBalances() (map[string]*Balance, error) {
 	return c.client.GetBalances()
 }
 
 // GetOrderBook delegates to the embedded client
-func (c *BaseCapableClient) GetOrderBook(symbol string, depth int) (*models.OrderBook, error) {
+func (c *DefaultClient) GetOrderBook(symbol string, depth int) (*models.OrderBook, error) {
 	return c.client.GetOrderBook(symbol, depth)
 }
 
 // GetCandles delegates to the embedded client
-func (c *BaseCapableClient) GetCandles(symbol string, interval string, since time.Time, limit int) ([]models.Candle, error) {
+func (c *DefaultClient) GetCandles(symbol string, interval string, since time.Time, limit int) ([]models.Candle, error) {
 	return c.client.GetCandles(symbol, interval, since, limit)
 }
 
 // GetTrades delegates to the embedded client
-func (c *BaseCapableClient) GetTrades(symbol string, since time.Time, limit int) ([]models.Trade, error) {
+func (c *DefaultClient) GetTrades(symbol string, since time.Time, limit int) ([]models.Trade, error) {
 	return c.client.GetTrades(symbol, since, limit)
 }
 
 // CancelAllOrders delegates to the embedded client
-func (c *BaseCapableClient) CancelAllOrders(symbol string) error {
+func (c *DefaultClient) CancelAllOrders(symbol string) error {
 	return c.client.CancelAllOrders(symbol)
 }
 
 // IsHealthy delegates to the embedded client
-func (c *BaseCapableClient) IsHealthy() bool {
+func (c *DefaultClient) IsHealthy() bool {
 	return c.client.IsHealthy()
 }
 
 // HasCapability checks if the exchange has a specific capability
-func (c *BaseCapableClient) HasCapability(capability ExchangeCapability) bool {
+func (c *DefaultClient) HasCapability(capability ExchangeCapability) bool {
 	for _, cap := range c.capabilities {
 		if cap == capability {
 			return true
@@ -229,17 +229,17 @@ func (c *BaseCapableClient) HasCapability(capability ExchangeCapability) bool {
 }
 
 // GetWebSocketClient returns the WebSocket client for the exchange
-func (c *BaseCapableClient) GetWebSocketClient() *gowscl.Client {
+func (c *DefaultClient) GetWebSocketClient() *gowscl.Client {
 	return c.wsClient
 }
 
-// GetWebSocketClient returns the WebSocket client for the exchange
-func (c *BaseCapableClient) GetTradingPairs() ([]TradingPair, error) {
-	return c.GetTradingPairs()
+// GetTradingPairs delegates to the embedded client
+func (c *DefaultClient) GetTradingPairs() ([]TradingPair, error) {
+	return c.client.GetTradingPairs()
 }
 
 // WithContext returns a new client with the given context
-func (c *BaseCapableClient) WithContext(ctx context.Context) CapableClient {
+func (c *DefaultClient) WithContext(ctx context.Context) Client {
 	newClient := *c
 	newClient.ctx = ctx
 	return &newClient
@@ -248,36 +248,36 @@ func (c *BaseCapableClient) WithContext(ctx context.Context) CapableClient {
 // Default implementations for extended capabilities
 
 // FetchHistoricalData fetches historical market data for a symbol
-func (c *BaseCapableClient) FetchHistoricalData(symbol string, interval string, start, end time.Time) ([]models.MarketData, error) {
+func (c *DefaultClient) FetchHistoricalData(symbol string, interval string, start, end time.Time) ([]models.MarketData, error) {
 	return nil, nil
 }
 
 // FetchTickers fetches tickers for multiple symbols
-func (c *BaseCapableClient) FetchTickers(symbols []string) (map[string]models.MarketData, error) {
+func (c *DefaultClient) FetchTickers(symbols []string) (map[string]models.MarketData, error) {
 	return nil, nil
 }
 
 // PlaceBulkOrders places multiple orders at once
-func (c *BaseCapableClient) PlaceBulkOrders(orders []Order) ([]string, error) {
+func (c *DefaultClient) PlaceBulkOrders(orders []Order) ([]string, error) {
 	return nil, nil
 }
 
 // GetAccountInfo gets account information
-func (c *BaseCapableClient) GetAccountInfo() (AccountInfo, error) {
+func (c *DefaultClient) GetAccountInfo() (AccountInfo, error) {
 	return AccountInfo{}, nil
 }
 
 // GetAllBalances gets all asset balances
-func (c *BaseCapableClient) GetAllBalances() (map[string]float64, error) {
+func (c *DefaultClient) GetAllBalances() (map[string]float64, error) {
 	return nil, nil
 }
 
 // Transfer transfers assets between accounts
-func (c *BaseCapableClient) Transfer(asset string, amount float64, fromAccount, toAccount string) error {
+func (c *DefaultClient) Transfer(asset string, amount float64, fromAccount, toAccount string) error {
 	return nil
 }
 
-// BaseClient is a base implementation of the Client interface
+// BaseClient is a base implementation of the ExchangeClient interface
 type BaseClient struct {
 	name      string
 	apiKey    string
@@ -309,7 +309,7 @@ func (c *BaseClient) SetHealth(healthy bool) { c.healthy = healthy }
 // ErrNotImplemented is returned when a method is not implemented
 var ErrNotImplemented = errors.New("method not implemented")
 
-// Default Client interface implementations that return ErrNotImplemented.
+// Default ExchangeClient interface implementations that return ErrNotImplemented.
 func (c *BaseClient) GetTradingPairs() ([]TradingPair, error)  { return nil, ErrNotImplemented }
 func (c *BaseClient) GetTicker(string) (*models.Ticker, error) { return nil, ErrNotImplemented }
 func (c *BaseClient) GetOrderBook(string, int) (*models.OrderBook, error) {
@@ -572,7 +572,7 @@ func (c *UnifiedClient) cacheOrderBook(symbol string, depth int, ob *models.Orde
 	c.setCache(c.cacheKey("orderbook:", symbol, ":", depth), &copyBook, c.cacheConfig.MarketDataTTL)
 }
 
-// --- Client interface implementation ------------------------------------
+// --- ExchangeClient interface implementation ------------------------------------
 
 // GetName returns a composite name describing the primary exchange managed by this client
 func (c *UnifiedClient) GetName() string {

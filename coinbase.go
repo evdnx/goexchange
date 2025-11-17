@@ -22,7 +22,7 @@ import (
 	"github.com/evdnx/gowscl"
 )
 
-// CoinbaseClient implements the Client interface for the Coinbase exchange
+// CoinbaseClient implements the ExchangeClient interface for the Coinbase exchange
 type CoinbaseClient struct {
 	*BaseClient
 	httpClient   *coinbaseHTTPClient

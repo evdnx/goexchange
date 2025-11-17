@@ -24,7 +24,7 @@ import (
 	"github.com/evdnx/gowscl"
 )
 
-// BinanceClient implements the Client interface for Binance spot and futures trading
+// BinanceClient implements the ExchangeClient interface for Binance spot and futures trading
 type BinanceClient struct {
 	*BaseClient
 	httpClient     *gohttpcl.Client
