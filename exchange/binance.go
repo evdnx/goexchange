@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	common "github.com/evdnx/goexchange/common"
 	"github.com/evdnx/goexchange/models"
 	"github.com/evdnx/gohttpcl"
 	"github.com/evdnx/golog"
@@ -26,7 +27,7 @@ import (
 
 // BinanceClient implements the ExchangeClient interface for Binance spot and futures trading
 type BinanceClient struct {
-	*BaseClient
+	*common.BaseClient
 	httpClient     *gohttpcl.Client
 	httpTimeout    time.Duration
 	wsClient       *BinanceWebSocketClient
@@ -85,7 +86,7 @@ type FundingRateInfo struct {
 
 // FuturesOrder extends Order with futures-specific fields
 type FuturesOrder struct {
-	Order
+	common.Order
 	ReduceOnly   bool   // Whether the order should only reduce position
 	PositionSide string // "BOTH", "LONG", or "SHORT" for hedge mode
 	MarginType   string // "isolated" or "cross"
@@ -133,7 +134,7 @@ func NewBinanceClient(apiKey, apiSecret string, testnet bool, metrics *metrics.M
 	}
 
 	client := &BinanceClient{
-		BaseClient:     NewBaseClient("Binance", apiKey, apiSecret, testnet),
+		BaseClient:     common.NewBaseClient("Binance", apiKey, apiSecret, testnet),
 		baseURL:        baseURL,
 		futuresBaseURL: futuresBaseURL,
 		wsURL:          wsURL,
@@ -159,7 +160,7 @@ func createBinanceHTTPClient(apiKey string, metrics *metrics.Metrics) *gohttpcl.
 		gohttpcl.WithTimeout(binanceHTTPTimeout),
 		gohttpcl.WithDefaultHeader("X-MBX-APIKEY", apiKey),
 	}
-	if collector := newHTTPMetricsCollector(metrics, "Binance"); collector != nil {
+	if collector := common.NewHTTPMetricsCollector(metrics, "Binance"); collector != nil {
 		opts = append(opts, gohttpcl.WithMetrics(collector))
 	}
 	return gohttpcl.New(opts...)
@@ -230,7 +231,7 @@ func (c *BinanceClient) doRequest(ctx context.Context, method, target string, bo
 		return nil, readErr
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, NewExchangeHTTPError(resp.StatusCode, payload, string(payload))
+		return nil, common.NewExchangeHTTPError(resp.StatusCode, payload, string(payload))
 	}
 	return payload, nil
 }
@@ -517,7 +518,7 @@ func (c *BinanceClient) GetOrderBook(symbol string, depth int) (*models.OrderBoo
 }
 
 // PlaceOrder places a spot market order
-func (c *BinanceClient) PlaceOrder(order Order) (string, error) {
+func (c *BinanceClient) PlaceOrder(order common.Order) (string, error) {
 	binanceSymbol := convertToBinanceSymbol(order.Symbol)
 	endpoint := fmt.Sprintf("%s/api/v3/order", c.baseURL)
 	params := url.Values{}
@@ -641,7 +642,7 @@ func (c *BinanceClient) CancelOrder(symbol, orderID string) error {
 }
 
 // GetOrderStatus retrieves the status of an order
-func (c *BinanceClient) GetOrderStatus(orderID string) (OrderStatus, error) {
+func (c *BinanceClient) GetOrderStatus(orderID string) (common.OrderStatus, error) {
 	endpoint := fmt.Sprintf("%s/api/v3/order", c.baseURL)
 	params := url.Values{}
 	params.Add("orderId", orderID)
@@ -667,18 +668,18 @@ func (c *BinanceClient) GetOrderStatus(orderID string) (OrderStatus, error) {
 
 	switch orderStatus.Status {
 	case "NEW", "PARTIALLY_FILLED":
-		return OrderStatusNew, nil
+		return common.OrderStatusNew, nil
 	case "FILLED":
-		return OrderStatusFilled, nil
+		return common.OrderStatusFilled, nil
 	case "CANCELED", "EXPIRED", "REJECTED":
-		return OrderStatusCancelled, nil
+		return common.OrderStatusCancelled, nil
 	default:
 		return "", fmt.Errorf("unknown order status: %s", orderStatus.Status)
 	}
 }
 
 // GetBalance returns the balance for a specific asset
-func (c *BinanceClient) GetBalance(asset string) (*Balance, error) {
+func (c *BinanceClient) GetBalance(asset string) (*common.Balance, error) {
 	balances, err := c.GetBalances()
 	if err != nil {
 		return nil, err
@@ -687,7 +688,7 @@ func (c *BinanceClient) GetBalance(asset string) (*Balance, error) {
 }
 
 // GetBalances returns all account balances
-func (c *BinanceClient) GetBalances() (map[string]*Balance, error) {
+func (c *BinanceClient) GetBalances() (map[string]*common.Balance, error) {
 	endpoint := fmt.Sprintf("%s/api/v3/account", c.baseURL)
 	params := url.Values{}
 	params = c.addSignature(params)
@@ -698,7 +699,7 @@ func (c *BinanceClient) GetBalances() (map[string]*Balance, error) {
 	}
 
 	var accountInfo struct {
-		Balances []Balance `json:"balances"`
+		Balances []common.Balance `json:"balances"`
 		BinanceResponse
 	}
 
@@ -710,7 +711,7 @@ func (c *BinanceClient) GetBalances() (map[string]*Balance, error) {
 		return nil, fmt.Errorf("account error: %s", accountInfo.Message)
 	}
 
-	balances := make(map[string]*Balance)
+	balances := make(map[string]*common.Balance)
 	for _, balance := range accountInfo.Balances {
 		balances[balance.Asset] = &balance
 	}
@@ -719,7 +720,7 @@ func (c *BinanceClient) GetBalances() (map[string]*Balance, error) {
 }
 
 // GetOpenOrders retrieves all open orders for a symbol
-func (c *BinanceClient) GetOpenOrders(symbol string) ([]Order, error) {
+func (c *BinanceClient) GetOpenOrders(symbol string) ([]common.Order, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
 	endpoint := fmt.Sprintf("%s/api/v3/openOrders", c.baseURL)
 	params := url.Values{}
@@ -745,16 +746,16 @@ func (c *BinanceClient) GetOpenOrders(symbol string) ([]Order, error) {
 		return nil, fmt.Errorf("failed to parse open orders: %w", err)
 	}
 
-	orders := make([]Order, len(openOrders))
+	orders := make([]common.Order, len(openOrders))
 	for i, o := range openOrders {
 		price, _ := strconv.ParseFloat(o.Price, 64)
 		quantity, _ := strconv.ParseFloat(o.OrigQty, 64)
 
-		orders[i] = Order{
+		orders[i] = common.Order{
 			ID:        strconv.FormatInt(o.OrderID, 10),
 			Symbol:    symbol,
-			Side:      OrderSideFromString(strings.ToLower(o.Side)),
-			Type:      OrderTypeFromString(strings.ToLower(o.Type)),
+			Side:      common.OrderSideFromString(strings.ToLower(o.Side)),
+			Type:      common.OrderTypeFromString(strings.ToLower(o.Type)),
 			Amount:    quantity,
 			Price:     price,
 			CreatedAt: time.Unix(o.Time/1000, 0),
@@ -767,7 +768,7 @@ func (c *BinanceClient) GetOpenOrders(symbol string) ([]Order, error) {
 }
 
 // GetOrders retrieves order history for a symbol
-func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]Order, error) {
+func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]common.Order, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
 	endpoint := fmt.Sprintf("%s/api/v3/allOrders", c.baseURL)
 	params := url.Values{}
@@ -795,16 +796,16 @@ func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]
 		return nil, fmt.Errorf("failed to parse orders: %w", err)
 	}
 
-	orders := make([]Order, len(ordersResponse))
+	orders := make([]common.Order, len(ordersResponse))
 	for i, order := range ordersResponse {
 		price, _ := strconv.ParseFloat(order.Price, 64)
 		quantity, _ := strconv.ParseFloat(order.OrigQty, 64)
 
-		orders[i] = Order{
+		orders[i] = common.Order{
 			ID:        strconv.FormatInt(order.OrderID, 10),
 			Symbol:    symbol,
-			Side:      OrderSideFromString(strings.ToLower(order.Side)),
-			Type:      OrderTypeFromString(strings.ToLower(order.Type)),
+			Side:      common.OrderSideFromString(strings.ToLower(order.Side)),
+			Type:      common.OrderTypeFromString(strings.ToLower(order.Type)),
 			Amount:    quantity,
 			Price:     price,
 			CreatedAt: time.Unix(order.Time/1000, 0),
@@ -817,7 +818,7 @@ func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]
 }
 
 // GetTradingPairs returns all available trading pairs
-func (c *BinanceClient) GetTradingPairs() ([]TradingPair, error) {
+func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 	endpoint := fmt.Sprintf("%s/api/v3/exchangeInfo", c.baseURL)
 	response, err := c.doGet(endpoint)
 	if err != nil {
@@ -838,10 +839,10 @@ func (c *BinanceClient) GetTradingPairs() ([]TradingPair, error) {
 		return nil, fmt.Errorf("failed to parse exchange info: %w", err)
 	}
 
-	var tradingPairs []TradingPair
+	var tradingPairs []common.TradingPair
 	for _, symbol := range exchangeInfo.Symbols {
 		if symbol.Status == "TRADING" {
-			tradingPairs = append(tradingPairs, TradingPair{
+			tradingPairs = append(tradingPairs, common.TradingPair{
 				Symbol:     symbol.Symbol,
 				BaseAsset:  symbol.BaseAsset,
 				QuoteAsset: symbol.QuoteAsset,
@@ -1307,7 +1308,7 @@ func NewBinanceWebSocketClient(wsURL, apiKey, apiSecret string) *BinanceWebSocke
 		subscriptions: make(map[string]binanceSubscription),
 		baseURL:       wsURL,
 		currentURL:    wsURL,
-		logger:        defaultLogger(),
+		logger:        common.DefaultLogger(),
 	}
 	client.replaceClient(wsURL)
 	return client
@@ -1323,7 +1324,7 @@ func (c *BinanceWebSocketClient) replaceClient(url string) {
 	c.connected = false
 	c.ws = gowscl.NewClient(
 		url,
-		gowscl.WithLogger(defaultLogger()),
+		gowscl.WithLogger(common.DefaultLogger()),
 		gowscl.WithOnMessage(func(data []byte, typ gowscl.MessageType) {
 			if err := c.HandleMessage(data); err != nil {
 				c.logger.Warnf("[%s] websocket message handling failed: %v", binanceWSComponent, err)

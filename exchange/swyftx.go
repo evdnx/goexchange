@@ -18,6 +18,7 @@ import (
 
 	"slices"
 
+	common "github.com/evdnx/goexchange/common"
 	"github.com/evdnx/goexchange/models"
 	"github.com/evdnx/gohttpcl"
 	"github.com/evdnx/golog"
@@ -34,7 +35,7 @@ const (
 
 // SwyftxClient implements the ExchangeClient interface for the Swyftx exchange.
 type SwyftxClient struct {
-	*BaseClient
+	*common.BaseClient
 	baseURL     string
 	httpClient  *gohttpcl.Client
 	metrics     *metrics.Metrics
@@ -49,7 +50,7 @@ type SwyftxClient struct {
 	assetMu       sync.RWMutex
 	assets        map[string]*swyftxAsset
 	assetsByID    map[int]*swyftxAsset
-	assetPairs    []TradingPair
+	assetPairs    []common.TradingPair
 	assetsFetched time.Time
 }
 
@@ -105,10 +106,10 @@ func NewSwyftxClient(apiKey, apiSecret string, testnet bool, metricsClient *metr
 		baseURL = "https://api.demo.swyftx.com.au"
 	}
 	client := &SwyftxClient{
-		BaseClient:  NewBaseClient("Swyftx", apiKey, apiSecret, testnet),
+		BaseClient:  common.NewBaseClient("Swyftx", apiKey, apiSecret, testnet),
 		baseURL:     strings.TrimRight(baseURL, "/"),
 		metrics:     metricsClient,
-		logger:      defaultLogger(),
+		logger:      common.DefaultLogger(),
 		userAgent:   swyftxUserAgent,
 		httpTimeout: swyftxHTTPTimeout,
 	}
@@ -126,7 +127,7 @@ func createSwyftxHTTPClient(metricsClient *metrics.Metrics) *gohttpcl.Client {
 		gohttpcl.WithBackoffStrategy(gohttpcl.BackoffExponential),
 		gohttpcl.WithRetryBudget(0.2, time.Minute),
 	}
-	if collector := newHTTPMetricsCollector(metricsClient, "Swyftx"); collector != nil {
+	if collector := common.NewHTTPMetricsCollector(metricsClient, "Swyftx"); collector != nil {
 		opts = append(opts, gohttpcl.WithMetrics(collector))
 	}
 	return gohttpcl.New(opts...)
@@ -180,7 +181,7 @@ func (c *SwyftxClient) doRequest(ctx context.Context, method, path string, body 
 		return nil, readErr
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, NewExchangeHTTPError(resp.StatusCode, data, string(data))
+		return nil, common.NewExchangeHTTPError(resp.StatusCode, data, string(data))
 	}
 	return data, nil
 }
@@ -199,7 +200,7 @@ func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 		return c.accessToken, nil
 	}
 	if c.APIKey() == "" {
-		return "", NewAuthenticationError("swyftx api key required")
+		return "", common.NewAuthenticationError("swyftx api key required")
 	}
 	body := map[string]string{"apiKey": c.APIKey()}
 	data, err := c.doRequest(ctx, http.MethodPost, "/auth/refresh/", body, false)
@@ -279,7 +280,7 @@ func (c *SwyftxClient) ensureAssets(ctx context.Context) error {
 	return nil
 }
 
-func (c *SwyftxClient) buildTradingPairsLocked() []TradingPair {
+func (c *SwyftxClient) buildTradingPairsLocked() []common.TradingPair {
 	if len(c.assets) == 0 {
 		return nil
 	}
@@ -292,14 +293,14 @@ func (c *SwyftxClient) buildTradingPairsLocked() []TradingPair {
 	if len(quotes) == 0 {
 		return nil
 	}
-	var pairs []TradingPair
+	var pairs []common.TradingPair
 	for _, quote := range quotes {
 		for _, base := range c.assets {
 			if !bool(base.Secondary) || base.ID == quote.ID {
 				continue
 			}
 			symbol := fmt.Sprintf("%s/%s", base.Code, quote.Code)
-			pairs = append(pairs, TradingPair{
+			pairs = append(pairs, common.TradingPair{
 				Symbol:     symbol,
 				BaseAsset:  base.Code,
 				QuoteAsset: quote.Code,
@@ -332,13 +333,13 @@ func (c *SwyftxClient) resolveSymbol(ctx context.Context, symbol string) (*swyft
 }
 
 // GetTradingPairs returns supported trading pairs.
-func (c *SwyftxClient) GetTradingPairs() ([]TradingPair, error) {
+func (c *SwyftxClient) GetTradingPairs() ([]common.TradingPair, error) {
 	if err := c.ensureAssets(context.Background()); err != nil {
 		return nil, err
 	}
 	c.assetMu.RLock()
 	defer c.assetMu.RUnlock()
-	pairs := make([]TradingPair, len(c.assetPairs))
+	pairs := make([]common.TradingPair, len(c.assetPairs))
 	copy(pairs, c.assetPairs)
 	return pairs, nil
 }
@@ -679,7 +680,7 @@ type swyftxAssetHistoryResponse struct {
 }
 
 // GetBalance returns balance for a single currency.
-func (c *SwyftxClient) GetBalance(currency string) (*Balance, error) {
+func (c *SwyftxClient) GetBalance(currency string) (*common.Balance, error) {
 	balances, err := c.GetBalances()
 	if err != nil {
 		return nil, err
@@ -692,7 +693,7 @@ func (c *SwyftxClient) GetBalance(currency string) (*Balance, error) {
 }
 
 // GetBalances returns all balances.
-func (c *SwyftxClient) GetBalances() (map[string]*Balance, error) {
+func (c *SwyftxClient) GetBalances() (map[string]*common.Balance, error) {
 	ctx := context.Background()
 	if err := c.ensureAssets(ctx); err != nil {
 		return nil, err
@@ -711,13 +712,13 @@ func (c *SwyftxClient) GetBalances() (map[string]*Balance, error) {
 	}
 	c.assetMu.RLock()
 	defer c.assetMu.RUnlock()
-	balances := make(map[string]*Balance, len(resp))
+	balances := make(map[string]*common.Balance, len(resp))
 	for _, entry := range resp {
 		asset := c.assetsByID[entry.AssetID]
 		if asset == nil {
 			continue
 		}
-		balances[asset.Code] = &Balance{
+		balances[asset.Code] = &common.Balance{
 			Asset:  asset.Code,
 			Free:   entry.AvailableBalance,
 			Locked: entry.LockedBalance,
@@ -727,7 +728,7 @@ func (c *SwyftxClient) GetBalances() (map[string]*Balance, error) {
 }
 
 // CreateOrder submits a new order using the /orders/ endpoint.
-func (c *SwyftxClient) CreateOrder(symbol string, side OrderSide, orderType OrderType, amount, price float64) (*Order, error) {
+func (c *SwyftxClient) CreateOrder(symbol string, side common.OrderSide, orderType common.OrderType, amount, price float64) (*common.Order, error) {
 	ctx := context.Background()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
@@ -739,7 +740,7 @@ func (c *SwyftxClient) CreateOrder(symbol string, side OrderSide, orderType Orde
 	}
 	quantity := amount
 	assetQuantity := baseAsset.Code
-	if side == OrderSideBuy {
+	if side == common.OrderSideBuy {
 		assetQuantity = quoteAsset.Code
 	}
 	body := map[string]string{
@@ -763,15 +764,15 @@ func (c *SwyftxClient) CreateOrder(symbol string, side OrderSide, orderType Orde
 	return convertSwyftxOrder(symbol, &resp.Order)
 }
 
-func mapSwyftxOrderType(side OrderSide, orderType OrderType) (int, error) {
+func mapSwyftxOrderType(side common.OrderSide, orderType common.OrderType) (int, error) {
 	switch orderType {
-	case OrderTypeMarket:
-		if side == OrderSideBuy {
+	case common.OrderTypeMarket:
+		if side == common.OrderSideBuy {
 			return 1, nil
 		}
 		return 2, nil
-	case OrderTypeLimit:
-		if side == OrderSideBuy {
+	case common.OrderTypeLimit:
+		if side == common.OrderSideBuy {
 			return 3, nil
 		}
 		return 4, nil
@@ -803,14 +804,14 @@ type swyftxOrderBody struct {
 	FeeAsset       string `json:"feeAsset"`
 }
 
-func convertSwyftxOrder(symbol string, body *swyftxOrderBody) (*Order, error) {
+func convertSwyftxOrder(symbol string, body *swyftxOrderBody) (*common.Order, error) {
 	if body == nil {
 		return nil, errors.New("swyftx: empty order body")
 	}
 	price := parseStringFloat(body.Rate)
 	amount := parseStringFloat(body.Quantity)
 	status := mapSwyftxOrderStatus(body.Status)
-	return &Order{
+	return &common.Order{
 		ID:              body.OrderUUID,
 		Symbol:          symbol,
 		Side:            mapSwyftxOrderSide(body.OrderType),
@@ -830,49 +831,49 @@ func convertSwyftxOrder(symbol string, body *swyftxOrderBody) (*Order, error) {
 	}, nil
 }
 
-func mapSwyftxOrderStatus(status int) OrderStatus {
+func mapSwyftxOrderStatus(status int) common.OrderStatus {
 	switch status {
 	case 1, 5:
-		return OrderStatusNew
+		return common.OrderStatusNew
 	case 2, 6, 8:
-		return OrderStatusCancelled
+		return common.OrderStatusCancelled
 	case 3:
-		return OrderStatusPartiallyFilled
+		return common.OrderStatusPartiallyFilled
 	case 4:
-		return OrderStatusFilled
+		return common.OrderStatusFilled
 	case 7, 9:
-		return OrderStatusRejected
+		return common.OrderStatusRejected
 	default:
-		return OrderStatusNew
+		return common.OrderStatusNew
 	}
 }
 
-func mapSwyftxOrderSide(orderType int) OrderSide {
+func mapSwyftxOrderSide(orderType int) common.OrderSide {
 	switch orderType {
 	case 1, 3, 5:
-		return OrderSideBuy
+		return common.OrderSideBuy
 	case 2, 4, 6:
-		return OrderSideSell
+		return common.OrderSideSell
 	default:
-		return OrderSideBuy
+		return common.OrderSideBuy
 	}
 }
 
-func mapSwyftxOrderTypeToGeneric(orderType int) OrderType {
+func mapSwyftxOrderTypeToGeneric(orderType int) common.OrderType {
 	switch orderType {
 	case 1, 2:
-		return OrderTypeMarket
+		return common.OrderTypeMarket
 	case 3, 4:
-		return OrderTypeLimit
+		return common.OrderTypeLimit
 	case 5, 6:
-		return OrderTypeStopLimit
+		return common.OrderTypeStopLimit
 	default:
-		return OrderTypeMarket
+		return common.OrderTypeMarket
 	}
 }
 
 // GetOrder retrieves a specific order by UUID.
-func (c *SwyftxClient) GetOrder(symbol, orderID string) (*Order, error) {
+func (c *SwyftxClient) GetOrder(symbol, orderID string) (*common.Order, error) {
 	path := fmt.Sprintf("/orders/byId/%s", orderID)
 	data, err := c.doRequest(context.Background(), http.MethodGet, path, nil, true)
 	if err != nil {
@@ -886,7 +887,7 @@ func (c *SwyftxClient) GetOrder(symbol, orderID string) (*Order, error) {
 }
 
 // GetOrders returns orders for a symbol.
-func (c *SwyftxClient) GetOrders(symbol string, since time.Time, limit int) ([]Order, error) {
+func (c *SwyftxClient) GetOrders(symbol string, since time.Time, limit int) ([]common.Order, error) {
 	ctx := context.Background()
 	baseAsset, _, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
@@ -905,7 +906,7 @@ func (c *SwyftxClient) GetOrders(symbol string, since time.Time, limit int) ([]O
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, err
 	}
-	orders := make([]Order, 0, len(resp))
+	orders := make([]common.Order, 0, len(resp))
 	for _, entry := range resp {
 		order, err := convertSwyftxOrder(symbol, &entry)
 		if err != nil {
@@ -933,7 +934,7 @@ func (c *SwyftxClient) CancelAllOrders(symbol string) error {
 		return err
 	}
 	for _, order := range orders {
-		if order.Status == OrderStatusFilled || order.Status == OrderStatusCancelled {
+		if order.Status == common.OrderStatusFilled || order.Status == common.OrderStatusCancelled {
 			continue
 		}
 		if cancelErr := c.CancelOrder(symbol, order.ID); cancelErr != nil {

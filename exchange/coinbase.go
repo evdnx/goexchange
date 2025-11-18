@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	common "github.com/evdnx/goexchange/common"
 	"github.com/evdnx/goexchange/models"
 	http_client "github.com/evdnx/gohttpcl"
 	metrics "github.com/evdnx/gotrademetrics"
@@ -24,7 +25,7 @@ import (
 
 // CoinbaseClient implements the ExchangeClient interface for the Coinbase exchange
 type CoinbaseClient struct {
-	*BaseClient
+	*common.BaseClient
 	httpClient   *coinbaseHTTPClient
 	wsClient     *CoinbaseWebSocketClient
 	baseURL      string
@@ -61,7 +62,7 @@ func NewCoinbaseClient(apiKey, apiSecret, passphrase string, testnet bool, metri
 	}
 
 	client := &CoinbaseClient{
-		BaseClient:  NewBaseClient("Coinbase", apiKey, apiSecret, testnet),
+		BaseClient:  common.NewBaseClient("Coinbase", apiKey, apiSecret, testnet),
 		baseURL:     baseURL,
 		wsURL:       wsURL,
 		passphrase:  passphrase,
@@ -88,7 +89,7 @@ func createCoinbaseHTTPClient(metrics *metrics.Metrics) *coinbaseHTTPClient {
 		http_client.WithRetryBudget(0.2, time.Minute),
 		http_client.WithDefaultHeader("User-Agent", "CryptoBot/1.0"),
 	}
-	if collector := newHTTPMetricsCollector(metrics, "Coinbase"); collector != nil {
+	if collector := common.NewHTTPMetricsCollector(metrics, "Coinbase"); collector != nil {
 		opts = append(opts, http_client.WithMetrics(collector))
 	}
 	return &coinbaseHTTPClient{
@@ -151,7 +152,7 @@ func (c *coinbaseHTTPClient) request(ctx context.Context, method, target string,
 		return nil, readErr
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, NewExchangeHTTPError(resp.StatusCode, payload, string(payload))
+		return nil, common.NewExchangeHTTPError(resp.StatusCode, payload, string(payload))
 	}
 	return payload, nil
 }
@@ -556,7 +557,7 @@ func (c *CoinbaseClient) getOrderBookHTTP(symbol string, depth int) (*models.Ord
 }
 
 // PlaceOrder places a market or limit order
-func (c *CoinbaseClient) PlaceOrder(order Order) (string, error) {
+func (c *CoinbaseClient) PlaceOrder(order common.Order) (string, error) {
 	coinbaseSymbol := convertToCoinbaseSymbol(order.Symbol)
 	endpoint := fmt.Sprintf("%s/orders", c.baseURL)
 
@@ -625,7 +626,7 @@ func (c *CoinbaseClient) CancelOrder(symbol, orderID string) error {
 }
 
 // GetOrderStatus retrieves the status of an order
-func (c *CoinbaseClient) GetOrderStatus(orderID string) (OrderStatus, error) {
+func (c *CoinbaseClient) GetOrderStatus(orderID string) (common.OrderStatus, error) {
 	endpoint := fmt.Sprintf("%s/orders/%s", c.baseURL, orderID)
 	response, err := c.httpClient.Get(endpoint, c.getHeaders("GET", endpoint, "", ""))
 	if err != nil {
@@ -649,21 +650,21 @@ func (c *CoinbaseClient) GetOrderStatus(orderID string) (OrderStatus, error) {
 
 	switch orderResponse.Status {
 	case "open", "pending", "active":
-		return OrderStatusNew, nil
+		return common.OrderStatusNew, nil
 	case "done", "settled":
 		if orderResponse.FilledSize == orderResponse.Size {
-			return OrderStatusFilled, nil
+			return common.OrderStatusFilled, nil
 		}
-		return OrderStatusCancelled, nil
+		return common.OrderStatusCancelled, nil
 	case "rejected", "cancelled":
-		return OrderStatusCancelled, nil
+		return common.OrderStatusCancelled, nil
 	default:
 		return "", fmt.Errorf("unknown order status: %s", orderResponse.Status)
 	}
 }
 
 // GetBalance returns the balance for a specific asset
-func (c *CoinbaseClient) GetBalance(asset string) (*Balance, error) {
+func (c *CoinbaseClient) GetBalance(asset string) (*common.Balance, error) {
 	balances, err := c.GetBalances()
 	if err != nil {
 		return nil, err
@@ -672,7 +673,7 @@ func (c *CoinbaseClient) GetBalance(asset string) (*Balance, error) {
 }
 
 // GetBalances returns all account balances
-func (c *CoinbaseClient) GetBalances() (map[string]*Balance, error) {
+func (c *CoinbaseClient) GetBalances() (map[string]*common.Balance, error) {
 	endpoint := fmt.Sprintf("%s/accounts", c.baseURL)
 	response, err := c.httpClient.Get(endpoint, c.getHeaders("GET", endpoint, "", ""))
 	if err != nil {
@@ -689,9 +690,9 @@ func (c *CoinbaseClient) GetBalances() (map[string]*Balance, error) {
 		return nil, fmt.Errorf("failed to parse accounts: %w", err)
 	}
 
-	balances := make(map[string]*Balance)
+	balances := make(map[string]*common.Balance)
 	for _, account := range accounts {
-		balances[account.Currency] = &Balance{
+		balances[account.Currency] = &common.Balance{
 			Asset:  account.Currency,
 			Free:   account.Available,
 			Locked: account.Hold,
@@ -702,7 +703,7 @@ func (c *CoinbaseClient) GetBalances() (map[string]*Balance, error) {
 }
 
 // GetOpenOrders retrieves all open orders for a symbol
-func (c *CoinbaseClient) GetOpenOrders(symbol string) ([]Order, error) {
+func (c *CoinbaseClient) GetOpenOrders(symbol string) ([]common.Order, error) {
 	coinbaseSymbol := convertToCoinbaseSymbol(symbol)
 	endpoint := fmt.Sprintf("%s/orders", c.baseURL)
 	params := url.Values{}
@@ -728,7 +729,7 @@ func (c *CoinbaseClient) GetOpenOrders(symbol string) ([]Order, error) {
 		return nil, fmt.Errorf("failed to parse open orders: %w", err)
 	}
 
-	orders := make([]Order, len(openOrders))
+	orders := make([]common.Order, len(openOrders))
 	for i, o := range openOrders {
 		price, _ := strconv.ParseFloat(o.Price, 64)
 		quantity, _ := strconv.ParseFloat(o.Size, 64)
@@ -736,11 +737,11 @@ func (c *CoinbaseClient) GetOpenOrders(symbol string) ([]Order, error) {
 		if err != nil {
 			timestamp = time.Now()
 		}
-		orders[i] = Order{
+		orders[i] = common.Order{
 			ID:        o.ID,
 			Symbol:    symbol,
-			Side:      OrderSideFromString(o.Side),
-			Type:      OrderTypeFromString(o.Type),
+			Side:      common.OrderSideFromString(o.Side),
+			Type:      common.OrderTypeFromString(o.Type),
 			Amount:    quantity,
 			Price:     price,
 			CreatedAt: timestamp,
@@ -753,7 +754,7 @@ func (c *CoinbaseClient) GetOpenOrders(symbol string) ([]Order, error) {
 }
 
 // GetOrders retrieves order history for a symbol
-func (c *CoinbaseClient) GetOrders(symbol string, since time.Time, limit int) ([]Order, error) {
+func (c *CoinbaseClient) GetOrders(symbol string, since time.Time, limit int) ([]common.Order, error) {
 	coinbaseSymbol := convertToCoinbaseSymbol(symbol)
 	endpoint := fmt.Sprintf("%s/orders", c.baseURL)
 	params := url.Values{}
@@ -778,7 +779,7 @@ func (c *CoinbaseClient) GetOrders(symbol string, since time.Time, limit int) ([
 		return nil, fmt.Errorf("failed to parse orders: %w", err)
 	}
 
-	orders := make([]Order, 0)
+	orders := make([]common.Order, 0)
 	for _, order := range ordersResponse {
 		createdAt, err := time.Parse(time.RFC3339, order.CreatedAt)
 		if err != nil {
@@ -789,11 +790,11 @@ func (c *CoinbaseClient) GetOrders(symbol string, since time.Time, limit int) ([
 		}
 		price, _ := strconv.ParseFloat(order.Price, 64)
 		quantity, _ := strconv.ParseFloat(order.Size, 64)
-		orders = append(orders, Order{
+		orders = append(orders, common.Order{
 			ID:        order.ID,
 			Symbol:    symbol,
-			Side:      OrderSideFromString(order.Side),
-			Type:      OrderTypeFromString(order.Type),
+			Side:      common.OrderSideFromString(order.Side),
+			Type:      common.OrderTypeFromString(order.Type),
 			Amount:    quantity,
 			Price:     price,
 			CreatedAt: createdAt,
@@ -809,7 +810,7 @@ func (c *CoinbaseClient) GetOrders(symbol string, since time.Time, limit int) ([
 }
 
 // GetTradingPairs returns all available trading pairs
-func (c *CoinbaseClient) GetTradingPairs() ([]TradingPair, error) {
+func (c *CoinbaseClient) GetTradingPairs() ([]common.TradingPair, error) {
 	endpoint := fmt.Sprintf("%s/products", c.baseURL)
 	response, err := c.httpClient.Get(endpoint, c.getHeaders("GET", endpoint, "", ""))
 	if err != nil {
@@ -827,10 +828,10 @@ func (c *CoinbaseClient) GetTradingPairs() ([]TradingPair, error) {
 		return nil, fmt.Errorf("failed to parse products: %w", err)
 	}
 
-	var tradingPairs []TradingPair
+	var tradingPairs []common.TradingPair
 	for _, product := range products {
 		if product.Status == "online" {
-			tradingPairs = append(tradingPairs, TradingPair{
+			tradingPairs = append(tradingPairs, common.TradingPair{
 				Symbol:     product.ID,
 				BaseAsset:  product.BaseCurrency,
 				QuoteAsset: product.QuoteCurrency,
@@ -1152,7 +1153,7 @@ func (c *CoinbaseWebSocketClient) replaceClient(url string) {
 		c.ws.Close()
 	}
 	c.wsURL = url
-	logger := defaultLogger()
+	logger := common.DefaultLogger()
 	c.connected = false
 	c.ws = gowscl.NewClient(
 		url,
