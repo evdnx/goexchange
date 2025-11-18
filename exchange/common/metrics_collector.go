@@ -1,4 +1,4 @@
-package exchange
+package common
 
 import (
 	"net/http"
@@ -15,7 +15,8 @@ type httpMetricsCollector struct {
 	service string
 }
 
-func newHTTPMetricsCollector(m *metrics.Metrics, service string) *httpMetricsCollector {
+// NewHTTPMetricsCollector builds a metrics collector compatible with gohttpcl.
+func NewHTTPMetricsCollector(m *metrics.Metrics, service string) *httpMetricsCollector {
 	if m == nil {
 		return nil
 	}

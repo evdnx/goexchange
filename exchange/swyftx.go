@@ -198,10 +198,10 @@ func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 	if c.accessToken != "" && time.Until(c.tokenExpiry) > swyftxTokenRefreshLeeway {
 		return c.accessToken, nil
 	}
-	if c.apiKey == "" {
+	if c.APIKey() == "" {
 		return "", NewAuthenticationError("swyftx api key required")
 	}
-	body := map[string]string{"apiKey": c.apiKey}
+	body := map[string]string{"apiKey": c.APIKey()}
 	data, err := c.doRequest(ctx, http.MethodPost, "/auth/refresh/", body, false)
 	if err != nil {
 		return "", err

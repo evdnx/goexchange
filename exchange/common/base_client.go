@@ -1,4 +1,4 @@
-package exchange
+package common
 
 import (
 	"errors"
@@ -47,6 +47,15 @@ func NewBaseClient(name, apiKey, apiSecret string, testnet bool) *BaseClient {
 
 // GetName returns the name of the exchange
 func (c *BaseClient) GetName() string { return c.name }
+
+// APIKey returns the configured API key.
+func (c *BaseClient) APIKey() string { return c.apiKey }
+
+// APISecret returns the configured API secret.
+func (c *BaseClient) APISecret() string { return c.apiSecret }
+
+// IsTestnet reports whether the client is targeting a testnet environment.
+func (c *BaseClient) IsTestnet() bool { return c.testnet }
 
 // IsHealthy returns true if the exchange is healthy
 func (c *BaseClient) IsHealthy() bool { return c.healthy }

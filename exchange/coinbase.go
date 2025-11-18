@@ -183,7 +183,7 @@ func (c *CoinbaseClient) getHeaders(method, endpoint, query, body string) map[st
 	signature := c.generateSignature(message)
 
 	return map[string]string{
-		"CB-ACCESS-KEY":        c.apiKey,
+		"CB-ACCESS-KEY":        c.APIKey(),
 		"CB-ACCESS-SIGN":       signature,
 		"CB-ACCESS-TIMESTAMP":  timestamp,
 		"CB-ACCESS-PASSPHRASE": c.passphrase,
@@ -193,9 +193,9 @@ func (c *CoinbaseClient) getHeaders(method, endpoint, query, body string) map[st
 
 // generateSignature creates an HMAC-SHA256 signature
 func (c *CoinbaseClient) generateSignature(message string) string {
-	secretBytes, err := base64.StdEncoding.DecodeString(c.apiSecret)
+	secretBytes, err := base64.StdEncoding.DecodeString(c.APISecret())
 	if err != nil {
-		secretBytes = []byte(c.apiSecret)
+		secretBytes = []byte(c.APISecret())
 	}
 	h := hmac.New(sha256.New, secretBytes)
 	h.Write([]byte(message))

@@ -1,4 +1,4 @@
-package exchange
+package common
 
 import (
 	"fmt"
@@ -13,7 +13,8 @@ var (
 	sharedLoggerErr  error
 )
 
-func defaultLogger() *golog.Logger {
+// DefaultLogger returns a lazily initialized shared logger instance.
+func DefaultLogger() *golog.Logger {
 	sharedLoggerOnce.Do(func() {
 		sharedLogger, sharedLoggerErr = golog.NewLogger(
 			golog.WithStdOutProvider(golog.ConsoleEncoder),

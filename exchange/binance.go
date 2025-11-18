@@ -168,7 +168,7 @@ func createBinanceHTTPClient(apiKey string, metrics *metrics.Metrics) *gohttpcl.
 // getHeaders returns standard API request headers
 func (c *BinanceClient) getHeaders() map[string]string {
 	return map[string]string{
-		"X-MBX-APIKEY": c.apiKey,
+		"X-MBX-APIKEY": c.APIKey(),
 	}
 }
 
@@ -177,7 +177,7 @@ func (c *BinanceClient) addSignature(params url.Values) url.Values {
 	timestamp := fmt.Sprintf("%d", time.Now().UnixNano()/int64(time.Millisecond))
 	params.Add("timestamp", timestamp)
 	payload := params.Encode()
-	signature := createHMACSHA256Signature(payload, c.apiSecret)
+	signature := createHMACSHA256Signature(payload, c.APISecret())
 	params.Add("signature", signature)
 	return params
 }
