@@ -3,7 +3,7 @@ package exchange
 import (
 	"time"
 
-	common "github.com/evdnx/goexchange/exchange/common"
+	common "github.com/evdnx/goexchange/common"
 	"github.com/evdnx/gohttpcl"
 	"github.com/evdnx/golog"
 	metrics "github.com/evdnx/gotrademetrics"
