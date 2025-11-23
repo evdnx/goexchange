@@ -526,8 +526,8 @@ func (c *BinanceClient) PlaceOrder(order common.Order) (string, error) {
 	params.Add("side", strings.ToUpper(order.Side.String()))
 	params.Add("type", strings.ToUpper(order.Type.String()))
 
-	if order.Type == "LIMIT" {
-		params.Add("timeInForce", "GTC")
+	if strings.EqualFold(order.Type.String(), common.OrderTypeLimit.String()) {
+		params.Add("timeInForce", string(common.TimeInForceGTC))
 	}
 
 	quantity := order.Amount
@@ -573,8 +573,8 @@ func (c *BinanceClient) PlaceFuturesOrder(order FuturesOrder) (string, error) {
 	params.Add("side", strings.ToUpper(order.Side.String()))
 	params.Add("type", strings.ToUpper(order.Type.String()))
 
-	if order.Type == "LIMIT" {
-		params.Add("timeInForce", "GTC")
+	if strings.EqualFold(order.Type.String(), common.OrderTypeLimit.String()) {
+		params.Add("timeInForce", string(common.TimeInForceGTC))
 	}
 
 	quantity := order.Amount
@@ -641,41 +641,108 @@ func (c *BinanceClient) CancelOrder(symbol, orderID string) error {
 	return nil
 }
 
-// GetOrderStatus retrieves the status of an order
-func (c *BinanceClient) GetOrderStatus(orderID string) (common.OrderStatus, error) {
+func binanceStatusToCommon(status string) (common.OrderStatus, error) {
+	switch strings.ToUpper(status) {
+	case "NEW":
+		return common.OrderStatusNew, nil
+	case "PARTIALLY_FILLED":
+		return common.OrderStatusPartiallyFilled, nil
+	case "FILLED":
+		return common.OrderStatusFilled, nil
+	case "CANCELED", "PENDING_CANCEL", "REJECTED":
+		return common.OrderStatusCancelled, nil
+	case "EXPIRED", "EXPIRED_IN_MATCH":
+		return common.OrderStatusExpired, nil
+	default:
+		return "", fmt.Errorf("unknown order status: %s", status)
+	}
+}
+
+// GetOrder fetches a specific order by symbol and ID.
+func (c *BinanceClient) GetOrder(symbol, orderID string) (*common.Order, error) {
+	if strings.TrimSpace(symbol) == "" {
+		return nil, fmt.Errorf("symbol is required to query an order")
+	}
+	if strings.TrimSpace(orderID) == "" {
+		return nil, fmt.Errorf("orderID is required to query an order")
+	}
 	endpoint := fmt.Sprintf("%s/api/v3/order", c.baseURL)
 	params := url.Values{}
+	params.Add("symbol", convertToBinanceSymbol(symbol))
 	params.Add("orderId", orderID)
 	params = c.addSignature(params)
 
 	response, err := c.doGet(endpoint + "?" + params.Encode())
 	if err != nil {
-		return "", fmt.Errorf("failed to get order status: %w", err)
+		return nil, fmt.Errorf("failed to get order: %w", err)
 	}
 
-	var orderStatus struct {
-		Status string `json:"status"`
+	var orderResp struct {
+		Symbol                  string `json:"symbol"`
+		OrderID                 int64  `json:"orderId"`
+		ClientOrderID           string `json:"clientOrderId"`
+		Price                   string `json:"price"`
+		OrigQty                 string `json:"origQty"`
+		ExecutedQty             string `json:"executedQty"`
+		CumulativeQuoteQuantity string `json:"cummulativeQuoteQty"`
+		Status                  string `json:"status"`
+		TimeInForce             string `json:"timeInForce"`
+		Type                    string `json:"type"`
+		Side                    string `json:"side"`
+		StopPrice               string `json:"stopPrice"`
+		IcebergQuantity         string `json:"icebergQty"`
+		Time                    int64  `json:"time"`
+		UpdateTime              int64  `json:"updateTime"`
+		IsWorking               bool   `json:"isWorking"`
 		BinanceResponse
 	}
 
-	if err := json.Unmarshal(response, &orderStatus); err != nil {
-		return "", fmt.Errorf("failed to parse order status: %w", err)
+	if err := json.Unmarshal(response, &orderResp); err != nil {
+		return nil, fmt.Errorf("failed to parse order response: %w", err)
 	}
 
-	if orderStatus.Code != 0 {
-		return "", fmt.Errorf("status error: %s", orderStatus.Message)
+	if orderResp.Code != 0 {
+		return nil, fmt.Errorf("order error: %s", orderResp.Message)
 	}
 
-	switch orderStatus.Status {
-	case "NEW", "PARTIALLY_FILLED":
-		return common.OrderStatusNew, nil
-	case "FILLED":
-		return common.OrderStatusFilled, nil
-	case "CANCELED", "EXPIRED", "REJECTED":
-		return common.OrderStatusCancelled, nil
-	default:
-		return "", fmt.Errorf("unknown order status: %s", orderStatus.Status)
+	status, err := binanceStatusToCommon(orderResp.Status)
+	if err != nil {
+		return nil, err
 	}
+
+	price, _ := strconv.ParseFloat(orderResp.Price, 64)
+	amount, _ := strconv.ParseFloat(orderResp.OrigQty, 64)
+	filled, _ := strconv.ParseFloat(orderResp.ExecutedQty, 64)
+	symbolFormatted := symbol
+	if orderResp.Symbol != "" {
+		symbolFormatted = convertFromBinanceSymbol(orderResp.Symbol)
+	}
+
+	return &common.Order{
+		ID:              strconv.FormatInt(orderResp.OrderID, 10),
+		ClientOrderID:   orderResp.ClientOrderID,
+		Symbol:          symbolFormatted,
+		Side:            common.OrderSideFromString(strings.ToLower(orderResp.Side)),
+		Type:            common.OrderTypeFromString(strings.ToLower(orderResp.Type)),
+		Status:          status,
+		Price:           price,
+		Amount:          amount,
+		FilledAmount:    filled,
+		RemainingAmount: amount - filled,
+		CreatedAt:       time.Unix(orderResp.Time/1000, 0),
+		UpdatedAt:       time.Unix(orderResp.UpdateTime/1000, 0),
+		Quantity:        amount,
+		Timestamp:       time.Unix(orderResp.Time/1000, 0),
+	}, nil
+}
+
+// GetOrderStatus retrieves the status of an order
+func (c *BinanceClient) GetOrderStatus(symbol, orderID string) (common.OrderStatus, error) {
+	order, err := c.GetOrder(symbol, orderID)
+	if err != nil {
+		return "", err
+	}
+	return order.Status, nil
 }
 
 // GetBalance returns the balance for a specific asset
