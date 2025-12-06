@@ -36,12 +36,13 @@ const (
 // SwyftxClient implements the ExchangeClient interface for the Swyftx exchange.
 type SwyftxClient struct {
 	*common.BaseClient
-	baseURL     string
-	httpClient  *gohttpcl.Client
-	metrics     *metrics.Metrics
-	logger      *golog.Logger
-	userAgent   string
-	httpTimeout time.Duration
+	baseURL       string
+	publicBaseURL string
+	httpClient    *gohttpcl.Client
+	metrics       *metrics.Metrics
+	logger        *golog.Logger
+	userAgent     string
+	httpTimeout   time.Duration
 
 	tokenMu     sync.RWMutex
 	accessToken string
@@ -56,13 +57,13 @@ type SwyftxClient struct {
 
 // swyftxAsset describes an asset returned by the /markets/assets/ endpoint.
 type swyftxAsset struct {
-	ID         int     `json:"id"`
-	Code       string  `json:"code"`
-	Name       string  `json:"name"`
-	PrimaryRaw boolish `json:"primary"`
-	Secondary  boolish `json:"secondary"`
-	PriceScale int     `json:"price_scale"`
-	MinOrder   float64 `json:"minimum_order,string"`
+	ID         int      `json:"id"`
+	Code       string   `json:"code"`
+	Name       string   `json:"name"`
+	PrimaryRaw boolish  `json:"primary"`
+	Secondary  boolish  `json:"secondary"`
+	PriceScale int      `json:"price_scale"`
+	MinOrder   floatish `json:"minimum_order"`
 }
 
 func (a *swyftxAsset) Primary() bool {
@@ -99,19 +100,43 @@ func (b *boolish) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type floatish float64
+
+func (f *floatish) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if len(s) == 0 || s == "null" {
+		*f = 0
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.Trim(s, "\"")
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return err
+	}
+	*f = floatish(v)
+	return nil
+}
+
 // NewSwyftxClient creates a new Swyftx API client.
 func NewSwyftxClient(apiKey, apiSecret string, testnet bool, metricsClient *metrics.Metrics) *SwyftxClient {
 	baseURL := "https://api.swyftx.com.au"
+	publicBaseURL := baseURL
 	if testnet {
 		baseURL = "https://api.demo.swyftx.com.au"
 	}
+	if testnet {
+		publicBaseURL = "https://api.swyftx.com.au"
+	}
 	client := &SwyftxClient{
-		BaseClient:  common.NewBaseClient("Swyftx", apiKey, apiSecret, testnet),
-		baseURL:     strings.TrimRight(baseURL, "/"),
-		metrics:     metricsClient,
-		logger:      common.DefaultLogger(),
-		userAgent:   swyftxUserAgent,
-		httpTimeout: swyftxHTTPTimeout,
+		BaseClient:    common.NewBaseClient("Swyftx", apiKey, apiSecret, testnet),
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		publicBaseURL: strings.TrimRight(publicBaseURL, "/"),
+		metrics:       metricsClient,
+		logger:        common.DefaultLogger(),
+		userAgent:     swyftxUserAgent,
+		httpTimeout:   swyftxHTTPTimeout,
 	}
 	client.httpClient = createSwyftxHTTPClient(metricsClient)
 	return client
@@ -134,6 +159,18 @@ func createSwyftxHTTPClient(metricsClient *metrics.Metrics) *gohttpcl.Client {
 }
 
 func (c *SwyftxClient) doRequest(ctx context.Context, method, path string, body interface{}, auth bool) ([]byte, error) {
+	return c.doRequestWithBase(ctx, method, path, body, auth, c.baseURL)
+}
+
+func (c *SwyftxClient) doPublicRequest(ctx context.Context, method, path string, body interface{}) ([]byte, error) {
+	publicBase := c.publicBaseURL
+	if publicBase == "" {
+		publicBase = c.baseURL
+	}
+	return c.doRequestWithBase(ctx, method, path, body, false, publicBase)
+}
+
+func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path string, body interface{}, auth bool, baseURL string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -156,7 +193,7 @@ func (c *SwyftxClient) doRequest(ctx context.Context, method, path string, body 
 		}
 		headers["Authorization"] = "Bearer " + token
 	}
-	fullURL := c.baseURL + path
+	fullURL := strings.TrimRight(baseURL, "/") + path
 	opts := headerOptions(headers)
 	var resp *http.Response
 	var err error
@@ -259,7 +296,7 @@ func (c *SwyftxClient) ensureAssets(ctx context.Context) error {
 	if time.Since(c.assetsFetched) < swyftxAssetCacheTTL && len(c.assets) > 0 {
 		return nil
 	}
-	data, err := c.doRequest(ctx, http.MethodGet, "/markets/assets/", nil, false)
+	data, err := c.doPublicRequest(ctx, http.MethodGet, "/markets/assets/", nil)
 	if err != nil {
 		return err
 	}
@@ -386,7 +423,7 @@ type swyftxBasicInfo struct {
 
 func (c *SwyftxClient) getBasicMarketInfo(ctx context.Context, code string) (*swyftxBasicInfo, error) {
 	path := fmt.Sprintf("/markets/info/basic/%s/", strings.ToUpper(code))
-	data, err := c.doRequest(ctx, http.MethodGet, path, nil, false)
+	data, err := c.doPublicRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -473,11 +510,11 @@ func (c *SwyftxClient) syntheticOrderBook(symbol string, base, quote *swyftxAsse
 		Symbol:   symbol,
 		Bids: []models.OrderBookEntry{{
 			Price:  bidPrice,
-			Amount: base.MinOrder,
+			Amount: float64(base.MinOrder),
 		}},
 		Asks: []models.OrderBookEntry{{
 			Price:  askPrice,
-			Amount: base.MinOrder,
+			Amount: float64(base.MinOrder),
 		}},
 		Timestamp: time.Now(),
 	}, nil
@@ -549,7 +586,7 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 		query.Set("timeStart", strconv.FormatInt(since.Unix()*1000, 10))
 	}
 	path := fmt.Sprintf("/charts/getBars/%s/%s/BUY/?%s", strings.ToUpper(baseAsset.Code), strings.ToUpper(quoteAsset.Code), query.Encode())
-	data, err := c.doRequest(ctx, http.MethodGet, path, nil, false)
+	data, err := c.doPublicRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
