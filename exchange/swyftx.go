@@ -38,6 +38,7 @@ type SwyftxClient struct {
 	*common.BaseClient
 	baseURL       string
 	publicBaseURL string
+	authBaseURL   string
 	httpClient    *gohttpcl.Client
 	metrics       *metrics.Metrics
 	logger        *golog.Logger
@@ -123,16 +124,19 @@ func (f *floatish) UnmarshalJSON(data []byte) error {
 func NewSwyftxClient(apiKey, apiSecret string, testnet bool, metricsClient *metrics.Metrics) *SwyftxClient {
 	baseURL := "https://api.swyftx.com.au"
 	publicBaseURL := baseURL
+	authBaseURL := baseURL
 	if testnet {
 		baseURL = "https://api.demo.swyftx.com.au"
 	}
 	if testnet {
 		publicBaseURL = "https://api.swyftx.com.au"
+		authBaseURL = publicBaseURL
 	}
 	client := &SwyftxClient{
 		BaseClient:    common.NewBaseClient("Swyftx", apiKey, apiSecret, testnet),
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		publicBaseURL: strings.TrimRight(publicBaseURL, "/"),
+		authBaseURL:   strings.TrimRight(authBaseURL, "/"),
 		metrics:       metricsClient,
 		logger:        common.DefaultLogger(),
 		userAgent:     swyftxUserAgent,
@@ -240,7 +244,16 @@ func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 		return "", common.NewAuthenticationError("swyftx api key required")
 	}
 	body := map[string]string{"apiKey": c.APIKey()}
-	data, err := c.doRequest(ctx, http.MethodPost, "/auth/refresh/", body, false)
+	authBase := c.authBaseURL
+	if authBase == "" {
+		authBase = c.baseURL
+	}
+	data, err := c.doRequestWithBase(ctx, http.MethodPost, "/auth/refresh/", body, false, authBase)
+	if err != nil && c.publicBaseURL != "" && !strings.EqualFold(authBase, c.publicBaseURL) {
+		if httpErr, ok := err.(*common.ExchangeError); ok && httpErr.StatusCode == http.StatusNotFound {
+			data, err = c.doRequestWithBase(ctx, http.MethodPost, "/auth/refresh/", body, false, c.publicBaseURL)
+		}
+	}
 	if err != nil {
 		return "", err
 	}
@@ -410,6 +423,66 @@ func (c *SwyftxClient) GetTicker(symbol string) (*models.Ticker, error) {
 		Bid:       sellPrice,
 		Ask:       buyPrice,
 		Timestamp: time.Now(),
+	}, nil
+}
+
+// FetchMarketData returns a simplified OHLC snapshot using public ticker endpoints.
+func (c *SwyftxClient) FetchMarketData(symbol string) (models.MarketData, error) {
+	ctx := context.Background()
+	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
+	if err != nil {
+		return models.MarketData{}, err
+	}
+	info, err := c.getBasicMarketInfo(ctx, baseAsset.Code)
+	if err != nil {
+		return models.MarketData{}, err
+	}
+	rate, err := c.callRate(ctx, baseAsset.Code, quoteAsset.Code, swyftxDefaultRateAmount)
+	if err != nil {
+		return models.MarketData{}, err
+	}
+
+	lastPrice := parseStringFloat(rate.Price)
+	buy := parseStringFloat(info.Buy)
+	sell := parseStringFloat(info.Sell)
+	if lastPrice == 0 {
+		lastPrice = (buy + sell) / 2
+	}
+
+	high := lastPrice
+	low := lastPrice
+	if buy > 0 {
+		if buy > high {
+			high = buy
+		}
+		if low == 0 || buy < low {
+			low = buy
+		}
+	}
+	if sell > 0 {
+		if sell > high {
+			high = sell
+		}
+		if low == 0 || sell < low {
+			low = sell
+		}
+	}
+
+	price := lastPrice
+	bid := sell
+	ask := buy
+
+	return models.MarketData{
+		Symbol:    symbol,
+		Timestamp: time.Now(),
+		Open:      lastPrice,
+		High:      high,
+		Low:       low,
+		Close:     lastPrice,
+		Volume:    info.Volume24H,
+		Price:     &price,
+		Bid:       &bid,
+		Ask:       &ask,
 	}, nil
 }
 
