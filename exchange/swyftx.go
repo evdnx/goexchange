@@ -58,13 +58,17 @@ type SwyftxClient struct {
 
 // swyftxAsset describes an asset returned by the /markets/assets/ endpoint.
 type swyftxAsset struct {
-	ID         int      `json:"id"`
-	Code       string   `json:"code"`
-	Name       string   `json:"name"`
-	PrimaryRaw boolish  `json:"primary"`
-	Secondary  boolish  `json:"secondary"`
-	PriceScale int      `json:"price_scale"`
-	MinOrder   floatish `json:"minimum_order"`
+	ID              int      `json:"id"`
+	Code            string   `json:"code"`
+	Name            string   `json:"name"`
+	PrimaryRaw      boolish  `json:"primary"`
+	Secondary       boolish  `json:"secondary"`
+	PriceScale      int      `json:"price_scale"`
+	MinOrder        floatish `json:"minimum_order"`
+	DepositEnabled  boolish  `json:"deposit_enabled"`
+	WithdrawEnabled boolish  `json:"withdraw_enabled"`
+	Delisting       boolish  `json:"delisting"`
+	BuyDisabled     boolish  `json:"buyDisabled"`
 }
 
 func (a *swyftxAsset) Primary() bool {
@@ -334,19 +338,31 @@ func (c *SwyftxClient) buildTradingPairsLocked() []common.TradingPair {
 	if len(c.assets) == 0 {
 		return nil
 	}
+	// Filter primary assets (quotes): primary = 1, deposit_enabled = 1, withdraw_enabled = 1
 	var quotes []*swyftxAsset
 	for _, asset := range c.assets {
-		if asset.Primary() {
+		if asset.Primary() &&
+			bool(asset.DepositEnabled) &&
+			bool(asset.WithdrawEnabled) {
 			quotes = append(quotes, asset)
 		}
 	}
 	if len(quotes) == 0 {
 		return nil
 	}
+	// Filter secondary assets (bases): secondary = 1, deposit_enabled = 1, withdraw_enabled = 1,
+	// no delisting, and not disabled
 	var pairs []common.TradingPair
 	for _, quote := range quotes {
 		for _, base := range c.assets {
 			if !bool(base.Secondary) || base.ID == quote.ID {
+				continue
+			}
+			// Apply activity filters for secondary assets
+			if !bool(base.DepositEnabled) ||
+				!bool(base.WithdrawEnabled) ||
+				bool(base.Delisting) ||
+				bool(base.BuyDisabled) {
 				continue
 			}
 			symbol := fmt.Sprintf("%s/%s", base.Code, quote.Code)
