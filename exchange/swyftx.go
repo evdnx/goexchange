@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -408,6 +409,197 @@ func (c *SwyftxClient) GetTradingPairs() ([]common.TradingPair, error) {
 	pairs := make([]common.TradingPair, len(c.assetPairs))
 	copy(pairs, c.assetPairs)
 	return pairs, nil
+}
+
+// ScalpingCoin represents a coin ranked for scalping suitability.
+type ScalpingCoin struct {
+	Code       string  // Asset code (e.g., "XRP")
+	Name       string  // Asset name
+	Symbol     string  // Trading pair symbol (e.g., "XRP/AUD")
+	Volume     float64 // 24h volume in quote currency (AUD)
+	Volatility float64 // Daily volatility percentage (std dev of log returns)
+	Score      float64 // Ranking score (volume * volatility)
+}
+
+// FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
+// It filters coins by minimum volume, calculates volatility from 24h of 1-minute candles,
+// and ranks them by a score combining volume and volatility.
+//
+// Parameters:
+//   - quoteAsset: The quote currency to use (default: "AUD"). Must be a primary asset.
+//   - minVolume: Minimum 24h volume threshold in quote currency (default: 500000)
+//   - topN: Number of top coins to return (default: 10)
+//   - rateLimitDelay: Delay between API calls to respect rate limits in milliseconds (default: 200ms)
+//
+// Returns a sorted list of ScalpingCoin structs, ranked by score (volume * volatility).
+func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration) ([]ScalpingCoin, error) {
+	ctx := context.Background()
+	if err := c.ensureAssets(ctx); err != nil {
+		return nil, err
+	}
+
+	// Default values
+	if quoteAsset == "" {
+		quoteAsset = "AUD"
+	}
+	if minVolume <= 0 {
+		minVolume = 500000
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+	if rateLimitDelay <= 0 {
+		rateLimitDelay = 200 * time.Millisecond
+	}
+
+	quoteAsset = strings.ToUpper(quoteAsset)
+	c.assetMu.RLock()
+	quote := c.assets[quoteAsset]
+	if quote == nil || !quote.Primary() {
+		c.assetMu.RUnlock()
+		return nil, fmt.Errorf("quote asset %s not found or not a primary asset", quoteAsset)
+	}
+
+	// Get all active secondary assets (bases) that can be traded
+	var secondaryAssets []*swyftxAsset
+	for _, asset := range c.assets {
+		if bool(asset.Secondary) &&
+			asset.ID != quote.ID &&
+			bool(asset.DepositEnabled) &&
+			bool(asset.WithdrawEnabled) &&
+			!bool(asset.Delisting) &&
+			!bool(asset.BuyDisabled) {
+			secondaryAssets = append(secondaryAssets, asset)
+		}
+	}
+	c.assetMu.RUnlock()
+
+	if len(secondaryAssets) == 0 {
+		return nil, fmt.Errorf("no active secondary assets found for quote %s", quoteAsset)
+	}
+
+	// Analyze each asset
+	var rankedCoins []ScalpingCoin
+	since := time.Now().Add(-24 * time.Hour)
+
+	for i, asset := range secondaryAssets {
+		// Rate limiting: add delay between requests (except for the first one)
+		if i > 0 {
+			time.Sleep(rateLimitDelay)
+		}
+
+		symbol := fmt.Sprintf("%s/%s", asset.Code, quoteAsset)
+
+		// Fetch 24h of 1-minute candles (1440 candles = 24 hours)
+		candles, err := c.GetCandles(symbol, "1m", since, 1440)
+		if err != nil {
+			// Skip assets that fail to fetch data
+			continue
+		}
+
+		if len(candles) < 2 {
+			continue
+		}
+
+		// Calculate total volume
+		totalVolume := calculateTotalVolume(candles)
+
+		// Filter by minimum volume
+		if totalVolume < minVolume {
+			continue
+		}
+
+		// Calculate volatility from close prices
+		volatility := calculateVolatility(candles)
+		if volatility <= 0 {
+			continue
+		}
+
+		// Calculate score (volume * volatility)
+		score := totalVolume * volatility
+
+		rankedCoins = append(rankedCoins, ScalpingCoin{
+			Code:       asset.Code,
+			Name:       asset.Name,
+			Symbol:     symbol,
+			Volume:     totalVolume,
+			Volatility: volatility,
+			Score:      score,
+		})
+	}
+
+	// Sort by score (descending)
+	sort.Slice(rankedCoins, func(i, j int) bool {
+		return rankedCoins[i].Score > rankedCoins[j].Score
+	})
+
+	// Return top N
+	if len(rankedCoins) > topN {
+		rankedCoins = rankedCoins[:topN]
+	}
+
+	return rankedCoins, nil
+}
+
+// calculateTotalVolume sums the volume from all candles.
+func calculateTotalVolume(candles []models.Candle) float64 {
+	var total float64
+	for _, candle := range candles {
+		total += candle.Volume
+	}
+	return total
+}
+
+// calculateVolatility calculates the daily volatility as the standard deviation of log returns.
+// Returns volatility as a percentage.
+func calculateVolatility(candles []models.Candle) float64 {
+	if len(candles) < 2 {
+		return 0
+	}
+
+	// Extract close prices
+	prices := make([]float64, 0, len(candles))
+	for _, candle := range candles {
+		if candle.Close > 0 {
+			prices = append(prices, candle.Close)
+		}
+	}
+
+	if len(prices) < 2 {
+		return 0
+	}
+
+	// Calculate log returns
+	logReturns := make([]float64, 0, len(prices)-1)
+	for i := 0; i < len(prices)-1; i++ {
+		if prices[i] > 0 {
+			logReturns = append(logReturns, math.Log(prices[i+1]/prices[i]))
+		}
+	}
+
+	if len(logReturns) < 2 {
+		return 0
+	}
+
+	// Calculate mean
+	var sum float64
+	for _, ret := range logReturns {
+		sum += ret
+	}
+	mean := sum / float64(len(logReturns))
+
+	// Calculate variance
+	var variance float64
+	for _, ret := range logReturns {
+		diff := ret - mean
+		variance += diff * diff
+	}
+	variance /= float64(len(logReturns))
+
+	// Standard deviation (volatility) as percentage
+	stdDev := math.Sqrt(variance) * 100
+
+	return stdDev
 }
 
 // GetTicker returns ticker data for a symbol.
