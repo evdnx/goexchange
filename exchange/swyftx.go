@@ -491,6 +491,12 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 	var allAnalyzedCoins []ScalpingCoin // Track all coins for fallback
 	since := time.Now().Add(-24 * time.Hour)
 
+	// Debug counters
+	var candlesFetched, candlesInsufficient, volumeFiltered, volatilityFiltered int
+
+	var firstError error
+	var errorCount int
+
 	for i, asset := range secondaryAssets {
 		// Rate limiting: add delay between requests (except for the first one)
 		if i > 0 {
@@ -502,11 +508,22 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 		// Fetch 24h of 1-minute candles (1440 candles = 24 hours)
 		candles, err := c.GetCandles(symbol, "1m", since, 1440)
 		if err != nil {
+			// Track first error for debugging
+			if firstError == nil {
+				firstError = err
+			}
+			errorCount++
+			// Log first few errors for debugging
+			if errorCount <= 3 {
+				c.logger.Debugf("GetCandles failed for %s: %v", symbol, err)
+			}
 			// Skip assets that fail to fetch data
 			continue
 		}
+		candlesFetched++
 
 		if len(candles) < 2 {
+			candlesInsufficient++
 			continue
 		}
 
@@ -515,7 +532,7 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 
 		// Calculate volatility from close prices
 		volatility := calculateVolatility(candles)
-		
+
 		// Create coin entry (even if it doesn't meet all criteria)
 		coin := ScalpingCoin{
 			Code:       asset.Code,
@@ -525,17 +542,19 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 			Volatility: volatility,
 			Score:      totalVolume * volatility,
 		}
-		
+
 		// Always track all analyzed coins for fallback
 		allAnalyzedCoins = append(allAnalyzedCoins, coin)
 
 		// Filter by minimum volume
 		if totalVolume < minVolume {
+			volumeFiltered++
 			continue
 		}
 
 		// Filter by volatility
 		if volatility <= 0 {
+			volatilityFiltered++
 			continue
 		}
 
@@ -547,6 +566,20 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 	sort.Slice(rankedCoins, func(i, j int) bool {
 		return rankedCoins[i].Score > rankedCoins[j].Score
 	})
+
+	// Debug logging
+	c.logger.Debugf("FindScalpingCoins: secondaryAssets=%d, candlesFetched=%d, candlesInsufficient=%d, allAnalyzed=%d, volumeFiltered=%d, volatilityFiltered=%d, ranked=%d",
+		len(secondaryAssets), candlesFetched, candlesInsufficient, len(allAnalyzedCoins), volumeFiltered, volatilityFiltered, len(rankedCoins))
+
+	// If no coins were analyzed at all, this indicates a problem
+	if len(allAnalyzedCoins) == 0 {
+		errMsg := fmt.Sprintf("no coins could be analyzed: secondaryAssets=%d, candlesFetched=%d, candlesInsufficient=%d, errors=%d",
+			len(secondaryAssets), candlesFetched, candlesInsufficient, errorCount)
+		if firstError != nil {
+			errMsg += fmt.Sprintf(" - first error: %v", firstError)
+		}
+		return nil, fmt.Errorf("%s - check if GetCandles is working correctly", errMsg)
+	}
 
 	// If no coins meet the strict criteria, fall back to best available coin
 	if len(rankedCoins) == 0 && len(allAnalyzedCoins) > 0 {
@@ -916,7 +949,15 @@ func convertOrderBookEntries(entries []swyftxOrderBookEntry) []models.OrderBookE
 	return result
 }
 
-// GetCandles fetches OHLCV data using the /charts/getBars endpoint.
+// GetCandles fetches OHLCV data using the Swyftx charts endpoint.
+// Based on Swyftx API docs: https://swyftx.docs.apiary.io/
+// Endpoint: /getbars/ with query parameters:
+//   - baseAsset: Asset code (secondary asset)
+//   - secondaryAsset: Asset code (primary/quote asset)
+//   - resolution: Time span for candles
+//   - side: "ask" or "bid"
+//   - timeStart: Start time (milliseconds)
+//   - limit: Number of candles (max 20000)
 func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limit int) ([]models.Candle, error) {
 	ctx := context.Background()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
@@ -930,16 +971,32 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 	if limit <= 0 {
 		limit = 500
 	}
+	if limit > 20000 {
+		limit = 20000 // API maximum
+	}
+
+	// Build query parameters according to API docs
 	query := url.Values{}
+	query.Set("baseAsset", strings.ToUpper(baseAsset.Code))       // Secondary asset (base)
+	query.Set("secondaryAsset", strings.ToUpper(quoteAsset.Code)) // Primary asset (quote)
 	query.Set("resolution", strconv.Itoa(resolution))
+	query.Set("side", "bid") // Use "bid" for buy side
 	query.Set("limit", strconv.Itoa(limit))
 	if !since.IsZero() {
 		query.Set("timeStart", strconv.FormatInt(since.Unix()*1000, 10))
 	}
-	path := fmt.Sprintf("/charts/getBars/%s/%s/BUY/?%s", strings.ToUpper(baseAsset.Code), strings.ToUpper(quoteAsset.Code), query.Encode())
+
+	// Endpoint: /getbars/ with query parameters
+	path := fmt.Sprintf("/getbars/?%s", query.Encode())
 	data, err := c.doPublicRequest(ctx, http.MethodGet, path, nil)
+
+	// If public request fails, try with authentication
 	if err != nil {
-		return nil, err
+		data, err = c.doRequest(ctx, http.MethodGet, path, nil, true)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch candles for %s: %w", symbol, err)
 	}
 	var resp []swyftxCandle
 	if err := json.Unmarshal(data, &resp); err != nil {

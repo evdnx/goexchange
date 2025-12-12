@@ -45,6 +45,58 @@ func TestSwyftxFetchMarketData_TRX_AUD(t *testing.T) {
 	}
 }
 
+func TestSwyftxGetCandles_TRX_AUD(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Swyftx call in short mode")
+	}
+
+	client := NewSwyftxClient("", "", true, nil)
+
+	// Fetch 1 hour of 1-minute candles
+	// The fully built URL would look like:
+	// https://api.swyftx.com.au/getbars/?baseAsset=TRX&secondaryAsset=AUD&resolution=1&side=bid&limit=60&timeStart=<timestamp_in_ms>
+	// Where:
+	//   - baseAsset: TRX (secondary/base asset code)
+	//   - secondaryAsset: AUD (primary/quote asset code)
+	//   - resolution: 1 (1 minute)
+	//   - side: bid (for buy side)
+	//   - limit: 60 (number of candles)
+	//   - timeStart: Unix timestamp in milliseconds
+	since := time.Now().Add(-1 * time.Hour)
+	candles, err := client.GetCandles("TRX/AUD", "1m", since, 60)
+	if err != nil {
+		t.Fatalf("failed to fetch TRX/AUD candles: %v", err)
+	}
+	if len(candles) == 0 {
+		t.Fatal("expected at least one candle, got 0")
+	}
+
+	// Validate candle data
+	for i, candle := range candles {
+		if candle.Open <= 0 {
+			t.Errorf("candle %d: expected open > 0, got %f", i, candle.Open)
+		}
+		if candle.High <= 0 {
+			t.Errorf("candle %d: expected high > 0, got %f", i, candle.High)
+		}
+		if candle.Low <= 0 {
+			t.Errorf("candle %d: expected low > 0, got %f", i, candle.Low)
+		}
+		if candle.Close <= 0 {
+			t.Errorf("candle %d: expected close > 0, got %f", i, candle.Close)
+		}
+		if candle.High < candle.Low {
+			t.Errorf("candle %d: high (%f) should be >= low (%f)", i, candle.High, candle.Low)
+		}
+		if candle.OpenTime.IsZero() {
+			t.Errorf("candle %d: expected non-zero open time", i)
+		}
+	}
+
+	t.Logf("Successfully fetched %d candles for TRX/AUD", len(candles))
+	fmt.Printf("Successfully fetched %d candles for TRX/AUD\n", len(candles))
+}
+
 func TestSwyftxFindScalpingCoins(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live Swyftx call in short mode")
@@ -57,8 +109,18 @@ func TestSwyftxFindScalpingCoins(t *testing.T) {
 
 	client := NewSwyftxClient("", "", true, nil)
 
-	coins, err := client.FindScalpingCoins("AUD", 500000, 10, 200*time.Millisecond)
+	// First, let's check if we can get trading pairs to see if assets are loading
+	pairs, err := client.GetTradingPairs()
 	if err != nil {
+		t.Fatalf("failed to get trading pairs: %v", err)
+	}
+	t.Logf("Found %d total trading pairs", len(pairs))
+	fmt.Printf("Found %d total trading pairs\n", len(pairs))
+
+	coins, err := client.FindScalpingCoins("AUD", 1000, 10, 200*time.Millisecond)
+	if err != nil {
+		t.Logf("Error details: %v", err)
+		fmt.Printf("Error details: %v\n", err)
 		t.Fatalf("failed to find scalping coins: %v", err)
 	}
 
