@@ -32,6 +32,10 @@ const (
 	swyftxTokenRefreshLeeway = 45 * time.Second
 	swyftxUserAgent          = "GoExchangeClient/1.0"
 	swyftxDefaultRateAmount  = 100.0
+	// swyftxTokenExpiry is the default token expiry if JWT parsing fails.
+	// According to Swyftx API docs, access tokens last for a week (7 days).
+	// This fallback is only used if JWT expiry cannot be parsed from the token.
+	swyftxTokenExpiry = 7 * 24 * time.Hour
 )
 
 // SwyftxClient implements the ExchangeClient interface for the Swyftx exchange.
@@ -126,6 +130,11 @@ func (f *floatish) UnmarshalJSON(data []byte) error {
 }
 
 // NewSwyftxClient creates a new Swyftx API client.
+// According to Swyftx API documentation:
+// - Production base URL: https://api.swyftx.com.au
+// - Demo base URL: https://api.demo.swyftx.com.au
+// When testnet is true, the client uses the demo base URL.
+// Note: Demo mode may have limitations or differences compared to production.
 func NewSwyftxClient(apiKey, apiSecret string, testnet bool, metricsClient *metrics.Metrics) *SwyftxClient {
 	baseURL := "https://api.swyftx.com.au"
 	publicBaseURL := baseURL
@@ -191,11 +200,13 @@ func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path strin
 			return nil, err
 		}
 	}
+	// User-Agent header is required on most requests per Swyftx API documentation
 	headers := map[string]string{
 		"Content-Type": "application/json",
 		"User-Agent":   c.userAgent,
 	}
 	if auth {
+		// JWT token must be included in Authorization header as "Bearer <token>"
 		token, err := c.getAccessToken(ctx)
 		if err != nil {
 			return nil, err
@@ -232,6 +243,12 @@ func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path strin
 	return data, nil
 }
 
+// getAccessToken retrieves a valid JWT access token.
+// According to Swyftx API documentation:
+// - API keys (refresh tokens) are used to generate access tokens via /auth/refresh/
+// - The refresh endpoint does not require authentication
+// - Access tokens (JWTs) last for a week before expiring
+// - An API key can be used to generate any number of access tokens
 func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 	c.tokenMu.RLock()
 	token := c.accessToken
@@ -248,6 +265,10 @@ func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 	if c.APIKey() == "" {
 		return "", common.NewAuthenticationError("swyftx api key required")
 	}
+	// Refresh Access Token endpoint: POST /auth/refresh/
+	// Request body: {"apiKey": "<api_key>"}
+	// Response: {"accessToken": "<jwt_token>"}
+	// This endpoint does not require authentication
 	body := map[string]string{"apiKey": c.APIKey()}
 	authBase := c.authBaseURL
 	if authBase == "" {
@@ -271,10 +292,12 @@ func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 	if resp.AccessToken == "" {
 		return "", errors.New("swyftx: empty access token")
 	}
+	// Parse JWT expiry from token. Access tokens last for a week per API docs.
 	expiresAt := parseJWTExpiry(resp.AccessToken)
 	c.accessToken = resp.AccessToken
 	if expiresAt.IsZero() {
-		c.tokenExpiry = time.Now().Add(10 * time.Minute)
+		// Fallback: use default token expiry if JWT parsing fails
+		c.tokenExpiry = time.Now().Add(swyftxTokenExpiry)
 	} else {
 		c.tokenExpiry = expiresAt
 	}
@@ -1052,7 +1075,16 @@ func swyftxResolution(interval string) (int, error) {
 }
 
 // GetTrades returns historical trade-like records derived from the asset history endpoint.
+// Supports pagination via limit and page query parameters per Swyftx API documentation.
+// Pagination format: ?limit={resultsPerPage}&page={pageNumber}
+// Page numbers are one-based (page=1 is the first page).
 func (c *SwyftxClient) GetTrades(symbol string, since time.Time, limit int) ([]models.Trade, error) {
+	return c.GetTradesWithPagination(symbol, since, limit, 0)
+}
+
+// GetTradesWithPagination returns historical trade-like records with pagination support.
+// page parameter: 0 or negative means no pagination, positive values are one-based (page 1 is first page).
+func (c *SwyftxClient) GetTradesWithPagination(symbol string, since time.Time, limit, page int) ([]models.Trade, error) {
 	ctx := context.Background()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
@@ -1064,6 +1096,9 @@ func (c *SwyftxClient) GetTrades(symbol string, since time.Time, limit int) ([]m
 	}
 	if limit > 0 {
 		query.Set("limit", strconv.Itoa(limit))
+	}
+	if page > 0 {
+		query.Set("page", strconv.Itoa(page))
 	}
 	query.Set("type", "TRADE")
 	query.Set("sortDirection", "desc")
@@ -1332,7 +1367,16 @@ func (c *SwyftxClient) GetOrder(symbol, orderID string) (*common.Order, error) {
 }
 
 // GetOrders returns orders for a symbol.
+// Supports pagination via limit and page query parameters per Swyftx API documentation.
+// Pagination format: ?limit={resultsPerPage}&page={pageNumber}
+// Page numbers are one-based (page=1 is the first page).
 func (c *SwyftxClient) GetOrders(symbol string, since time.Time, limit int) ([]common.Order, error) {
+	return c.GetOrdersWithPagination(symbol, since, limit, 0)
+}
+
+// GetOrdersWithPagination returns orders for a symbol with pagination support.
+// page parameter: 0 or negative means no pagination, positive values are one-based (page 1 is first page).
+func (c *SwyftxClient) GetOrdersWithPagination(symbol string, since time.Time, limit, page int) ([]common.Order, error) {
 	ctx := context.Background()
 	baseAsset, _, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
@@ -1341,6 +1385,9 @@ func (c *SwyftxClient) GetOrders(symbol string, since time.Time, limit int) ([]c
 	query := url.Values{}
 	if limit > 0 {
 		query.Set("limit", strconv.Itoa(limit))
+	}
+	if page > 0 {
+		query.Set("page", strconv.Itoa(page))
 	}
 	path := fmt.Sprintf("/orders/%s?%s", strings.ToUpper(baseAsset.Code), query.Encode())
 	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
