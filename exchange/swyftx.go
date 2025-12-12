@@ -488,6 +488,7 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 
 	// Analyze each asset
 	var rankedCoins []ScalpingCoin
+	var allAnalyzedCoins []ScalpingCoin // Track all coins for fallback
 	since := time.Now().Add(-24 * time.Hour)
 
 	for i, asset := range secondaryAssets {
@@ -512,34 +513,60 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 		// Calculate total volume
 		totalVolume := calculateTotalVolume(candles)
 
-		// Filter by minimum volume
-		if totalVolume < minVolume {
-			continue
-		}
-
 		// Calculate volatility from close prices
 		volatility := calculateVolatility(candles)
-		if volatility <= 0 {
-			continue
-		}
-
-		// Calculate score (volume * volatility)
-		score := totalVolume * volatility
-
-		rankedCoins = append(rankedCoins, ScalpingCoin{
+		
+		// Create coin entry (even if it doesn't meet all criteria)
+		coin := ScalpingCoin{
 			Code:       asset.Code,
 			Name:       asset.Name,
 			Symbol:     symbol,
 			Volume:     totalVolume,
 			Volatility: volatility,
-			Score:      score,
-		})
+			Score:      totalVolume * volatility,
+		}
+		
+		// Always track all analyzed coins for fallback
+		allAnalyzedCoins = append(allAnalyzedCoins, coin)
+
+		// Filter by minimum volume
+		if totalVolume < minVolume {
+			continue
+		}
+
+		// Filter by volatility
+		if volatility <= 0 {
+			continue
+		}
+
+		// Add to ranked coins if it meets all criteria
+		rankedCoins = append(rankedCoins, coin)
 	}
 
 	// Sort by score (descending)
 	sort.Slice(rankedCoins, func(i, j int) bool {
 		return rankedCoins[i].Score > rankedCoins[j].Score
 	})
+
+	// If no coins meet the strict criteria, fall back to best available coin
+	if len(rankedCoins) == 0 && len(allAnalyzedCoins) > 0 {
+		// Sort all analyzed coins by volume (fallback to volume if no volatility)
+		sort.Slice(allAnalyzedCoins, func(i, j int) bool {
+			// Prefer coins with both volume and volatility, but fall back to volume
+			if allAnalyzedCoins[i].Volatility > 0 && allAnalyzedCoins[j].Volatility > 0 {
+				return allAnalyzedCoins[i].Score > allAnalyzedCoins[j].Score
+			}
+			if allAnalyzedCoins[i].Volatility > 0 {
+				return true
+			}
+			if allAnalyzedCoins[j].Volatility > 0 {
+				return false
+			}
+			return allAnalyzedCoins[i].Volume > allAnalyzedCoins[j].Volume
+		})
+		// Return at least the best coin
+		rankedCoins = []ScalpingCoin{allAnalyzedCoins[0]}
+	}
 
 	// Return top N
 	if len(rankedCoins) > topN {
