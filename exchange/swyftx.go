@@ -352,8 +352,9 @@ func (c *SwyftxClient) buildTradingPairsLocked() []common.TradingPair {
 		return nil
 	}
 	// Filter secondary assets (bases): secondary = 1, deposit_enabled = 1, withdraw_enabled = 1,
-	// no delisting, and not disabled
+	// no delisting, and not disabled. Also verify tradability with the API.
 	var pairs []common.TradingPair
+	ctx := context.Background()
 	for _, quote := range quotes {
 		for _, base := range c.assets {
 			if !bool(base.Secondary) || base.ID == quote.ID {
@@ -364,6 +365,10 @@ func (c *SwyftxClient) buildTradingPairsLocked() []common.TradingPair {
 				!bool(base.WithdrawEnabled) ||
 				bool(base.Delisting) ||
 				bool(base.BuyDisabled) {
+				continue
+			}
+			// Verify the asset is actually tradable by checking with the API
+			if !c.isAssetTradable(ctx, base.Code, quote.Code) {
 				continue
 			}
 			symbol := fmt.Sprintf("%s/%s", base.Code, quote.Code)
@@ -469,7 +474,10 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 			bool(asset.WithdrawEnabled) &&
 			!bool(asset.Delisting) &&
 			!bool(asset.BuyDisabled) {
-			secondaryAssets = append(secondaryAssets, asset)
+			// Verify the asset is actually tradable by checking with the API
+			if c.isAssetTradable(ctx, asset.Code, quoteAsset) {
+				secondaryAssets = append(secondaryAssets, asset)
+			}
 		}
 	}
 	c.assetMu.RUnlock()
@@ -734,6 +742,41 @@ func (c *SwyftxClient) callRate(ctx context.Context, buy, sell string, amount fl
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// isAssetTradable checks if a base asset can be traded against a quote asset by attempting
+// to fetch market info and rate data. Returns true if the asset is tradable, false otherwise.
+func (c *SwyftxClient) isAssetTradable(ctx context.Context, baseCode, quoteCode string) bool {
+	// Try to get basic market info first
+	_, err := c.getBasicMarketInfo(ctx, baseCode)
+	if err != nil {
+		return false
+	}
+	// Try to call rate API to verify tradability
+	_, err = c.callRate(ctx, baseCode, quoteCode, swyftxDefaultRateAmount)
+	if err != nil {
+		// Check if it's a non-tradable asset error
+		if httpErr, ok := err.(*common.ExchangeError); ok {
+			errMsg := strings.ToLower(httpErr.Message)
+			// Check message and raw response for non-tradable indicators
+			if strings.Contains(errMsg, "non-tradable") || strings.Contains(errMsg, "not tradable") {
+				return false
+			}
+			// Also check raw response if available
+			if len(httpErr.RawResponse) > 0 {
+				rawMsg := strings.ToLower(string(httpErr.RawResponse))
+				if strings.Contains(rawMsg, "non-tradable") || strings.Contains(rawMsg, "not tradable") {
+					return false
+				}
+			}
+			// For validation errors with "buy asset" in the message, assume non-tradable
+			if httpErr.Type == common.ErrorTypeValidation && strings.Contains(errMsg, "buy asset") {
+				return false
+			}
+		}
+		return false
+	}
+	return true
 }
 
 type swyftxRateResponse struct {
