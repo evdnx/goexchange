@@ -93,8 +93,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/RefreshTokenResponse"
                 }
               }
             }
@@ -145,8 +144,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "description": "Request body"
+                "$ref": "#/components/schemas/RefreshTokenRequest"
               }
             }
           }
@@ -1428,8 +1426,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Balance"
+                  }
                 }
               }
             }
@@ -5461,8 +5461,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Asset"
+                  }
                 }
               }
             }
@@ -5916,8 +5918,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/ExchangeRateResponse"
                 }
               }
             }
@@ -5968,8 +5969,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "description": "Request body"
+                "$ref": "#/components/schemas/ExchangeRateRequest"
               }
             }
           }
@@ -6153,8 +6153,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/OrderResponse"
                 }
               }
             }
@@ -6205,8 +6204,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "description": "Request body"
+                "$ref": "#/components/schemas/CreateOrderRequest"
               }
             }
           }
@@ -6307,8 +6305,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Order"
+                  }
                 }
               }
             }
@@ -6356,24 +6356,36 @@
         },
         "parameters": [
           {
+            "name": "asset",
+            "in": "query",
+            "required": false,
+            "description": "Asset code to filter orders by",
+            "schema": {
+              "type": "string",
+              "example": "BTC"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
-            "description": "Number of results per page",
             "required": false,
+            "description": "Number of results per page",
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 100
             }
           },
           {
             "name": "page",
             "in": "query",
-            "description": "Page number (1-based)",
             "required": false,
+            "description": "Page number (1-based)",
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -6615,6 +6627,56 @@
             }
           }
         ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "summary": "Cancel Order",
+        "description": "Cancel an order by its UUID.",
+        "operationId": "delete_orders_orderUuid",
+        "tags": [
+          "Orders"
+        ],
+        "parameters": [
+          {
+            "name": "orderUuid",
+            "in": "path",
+            "required": true,
+            "description": "Order UUID",
+            "schema": {
+              "type": "string",
+              "example": "123e4567-e89b-12d3-a456-426614174000"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order cancelled successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Cancellation confirmation"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
         "security": [
           {
             "bearerAuth": []
@@ -7391,6 +7453,394 @@
           }
         ]
       }
+    },
+    "/markets/info/basic/{code}/": {
+      "get": {
+        "summary": "Get Basic Market Info",
+        "description": "Get basic market information for a specific asset code including buy/sell prices and 24h volume.",
+        "operationId": "get_markets_info_basic_code",
+        "tags": [
+          "Markets"
+        ],
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "required": true,
+            "description": "Asset code (e.g., BTC, ETH)",
+            "schema": {
+              "type": "string",
+              "example": "BTC"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BasicMarketInfo"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/orderbook/{base}/{quote}/": {
+      "get": {
+        "summary": "Get Order Book",
+        "description": "Get the order book (bids and asks) for a trading pair. Requires authentication.",
+        "operationId": "get_orderbook_base_quote",
+        "tags": [
+          "Markets"
+        ],
+        "parameters": [
+          {
+            "name": "base",
+            "in": "path",
+            "required": true,
+            "description": "Base asset code (secondary asset)",
+            "schema": {
+              "type": "string",
+              "example": "BTC"
+            }
+          },
+          {
+            "name": "quote",
+            "in": "path",
+            "required": true,
+            "description": "Quote asset code (primary asset)",
+            "schema": {
+              "type": "string",
+              "example": "AUD"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderBook"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/getbars/": {
+      "get": {
+        "summary": "Get OHLCV Candles",
+        "description": "Get historical OHLCV (Open, High, Low, Close, Volume) candle data for a trading pair. Requires authentication.",
+        "operationId": "get_getbars",
+        "tags": [
+          "Charts"
+        ],
+        "parameters": [
+          {
+            "name": "baseAsset",
+            "in": "query",
+            "required": true,
+            "description": "Base asset code (secondary asset)",
+            "schema": {
+              "type": "string",
+              "example": "BTC"
+            }
+          },
+          {
+            "name": "secondaryAsset",
+            "in": "query",
+            "required": true,
+            "description": "Quote asset code (primary asset)",
+            "schema": {
+              "type": "string",
+              "example": "AUD"
+            }
+          },
+          {
+            "name": "resolution",
+            "in": "query",
+            "required": true,
+            "description": "Time resolution in minutes (e.g., 1, 5, 15, 60, 240, 1440)",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "example": 60
+            }
+          },
+          {
+            "name": "side",
+            "in": "query",
+            "required": false,
+            "description": "Order side: \"ask\" or \"bid\"",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ask",
+                "bid"
+              ],
+              "default": "bid"
+            }
+          },
+          {
+            "name": "timeStart",
+            "in": "query",
+            "required": false,
+            "description": "Start time in milliseconds (Unix timestamp)",
+            "schema": {
+              "type": "integer",
+              "example": 1609459200000
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Number of candles to return (max 20000)",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000,
+              "default": 500
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Candle"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/portfolio/assetHistory/{id}/": {
+      "get": {
+        "summary": "Get Asset History",
+        "description": "Get transaction history for a specific asset. Supports pagination and filtering by type and date.",
+        "operationId": "get_portfolio_assetHistory_id",
+        "tags": [
+          "Portfolio"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Asset ID",
+            "schema": {
+              "type": "integer",
+              "example": 1
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "description": "Transaction type filter (e.g., TRADE, DEPOSIT, WITHDRAW)",
+            "schema": {
+              "type": "string",
+              "example": "TRADE"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "required": false,
+            "description": "Start date in milliseconds (Unix timestamp)",
+            "schema": {
+              "type": "integer",
+              "example": 1609459200000
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Number of results per page",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 100
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "description": "Page number (1-based)",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "sortKey",
+            "in": "query",
+            "required": false,
+            "description": "Field to sort by",
+            "schema": {
+              "type": "string",
+              "default": "date",
+              "example": "date"
+            }
+          },
+          {
+            "name": "sortDirection",
+            "in": "query",
+            "required": false,
+            "description": "Sort direction",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetHistoryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/orders/byId/{id}": {
+      "get": {
+        "summary": "Get Order by ID",
+        "description": "Retrieve a specific order by its UUID.",
+        "operationId": "get_orders_byId_id",
+        "tags": [
+          "Orders"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Order UUID",
+            "schema": {
+              "type": "string",
+              "example": "123e4567-e89b-12d3-a456-426614174000"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -7413,6 +7863,530 @@
           "code": {
             "type": "integer",
             "description": "Error code"
+          }
+        }
+      },
+      "BasicMarketInfo": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Asset code",
+            "example": "BTC"
+          },
+          "id": {
+            "type": "integer",
+            "description": "Asset ID",
+            "example": 1
+          },
+          "buy": {
+            "type": "string",
+            "description": "Buy price",
+            "example": "50000.00"
+          },
+          "sell": {
+            "type": "string",
+            "description": "Sell price",
+            "example": "49950.00"
+          },
+          "volume24H": {
+            "type": "number",
+            "description": "24-hour volume",
+            "example": 1234567.89
+          }
+        },
+        "required": [
+          "code",
+          "id"
+        ]
+      },
+      "Asset": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Asset ID",
+            "example": 1
+          },
+          "code": {
+            "type": "string",
+            "description": "Asset code",
+            "example": "BTC"
+          },
+          "name": {
+            "type": "string",
+            "description": "Asset name",
+            "example": "Bitcoin"
+          },
+          "primary": {
+            "type": [
+              "boolean",
+              "integer"
+            ],
+            "description": "Whether asset is a primary (quote) asset"
+          },
+          "secondary": {
+            "type": [
+              "boolean",
+              "integer"
+            ],
+            "description": "Whether asset is a secondary (base) asset"
+          },
+          "price_scale": {
+            "type": "integer",
+            "description": "Price decimal precision",
+            "example": 2
+          },
+          "minimum_order": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "Minimum order amount"
+          },
+          "deposit_enabled": {
+            "type": [
+              "boolean",
+              "integer"
+            ],
+            "description": "Whether deposits are enabled"
+          },
+          "withdraw_enabled": {
+            "type": [
+              "boolean",
+              "integer"
+            ],
+            "description": "Whether withdrawals are enabled"
+          },
+          "delisting": {
+            "type": [
+              "boolean",
+              "integer"
+            ],
+            "description": "Whether asset is being delisted"
+          },
+          "buyDisabled": {
+            "type": [
+              "boolean",
+              "integer"
+            ],
+            "description": "Whether buying is disabled"
+          }
+        },
+        "required": [
+          "id",
+          "code"
+        ]
+      },
+      "OrderBook": {
+        "type": "object",
+        "properties": {
+          "buy": {
+            "type": "array",
+            "description": "Buy orders (asks)",
+            "items": {
+              "$ref": "#/components/schemas/OrderBookEntry"
+            }
+          },
+          "sell": {
+            "type": "array",
+            "description": "Sell orders (bids)",
+            "items": {
+              "$ref": "#/components/schemas/OrderBookEntry"
+            }
+          },
+          "bids": {
+            "type": "array",
+            "description": "Bid orders (alternative format)",
+            "items": {
+              "$ref": "#/components/schemas/OrderBookEntry"
+            }
+          },
+          "asks": {
+            "type": "array",
+            "description": "Ask orders (alternative format)",
+            "items": {
+              "$ref": "#/components/schemas/OrderBookEntry"
+            }
+          }
+        }
+      },
+      "OrderBookEntry": {
+        "type": "object",
+        "properties": {
+          "price": {
+            "type": "string",
+            "description": "Price",
+            "example": "50000.00"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Amount",
+            "example": "1.5"
+          },
+          "quantity": {
+            "type": "string",
+            "description": "Quantity (alternative to amount)",
+            "example": "1.5"
+          },
+          "total": {
+            "type": "string",
+            "description": "Total value",
+            "example": "75000.00"
+          }
+        }
+      },
+      "Candle": {
+        "type": "object",
+        "properties": {
+          "time": {
+            "type": "integer",
+            "description": "Timestamp in milliseconds",
+            "example": 1609459200000
+          },
+          "open": {
+            "type": "string",
+            "description": "Open price",
+            "example": "50000.00"
+          },
+          "high": {
+            "type": "string",
+            "description": "High price",
+            "example": "51000.00"
+          },
+          "low": {
+            "type": "string",
+            "description": "Low price",
+            "example": "49000.00"
+          },
+          "close": {
+            "type": "string",
+            "description": "Close price",
+            "example": "50500.00"
+          },
+          "volume": {
+            "type": "number",
+            "description": "Volume",
+            "example": 1234.56
+          }
+        },
+        "required": [
+          "time",
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume"
+        ]
+      },
+      "AssetHistoryResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssetHistoryItem"
+            }
+          }
+        }
+      },
+      "AssetHistoryItem": {
+        "type": "object",
+        "properties": {
+          "uuid": {
+            "type": "string",
+            "description": "Transaction UUID"
+          },
+          "date": {
+            "type": "integer",
+            "description": "Timestamp in milliseconds"
+          },
+          "type": {
+            "type": "string",
+            "description": "Transaction type (e.g., TRADE, DEPOSIT, WITHDRAW)"
+          },
+          "primaryAsset": {
+            "type": "integer",
+            "description": "Primary asset ID"
+          },
+          "secondaryAsset": {
+            "type": "integer",
+            "description": "Secondary asset ID"
+          },
+          "primaryAmount": {
+            "type": "string",
+            "description": "Primary asset amount"
+          },
+          "secondaryAmount": {
+            "type": "string",
+            "description": "Secondary asset amount"
+          },
+          "feeAmount": {
+            "type": "string",
+            "description": "Fee amount"
+          }
+        }
+      },
+      "Order": {
+        "type": "object",
+        "properties": {
+          "orderUuid": {
+            "type": "string",
+            "description": "Order UUID"
+          },
+          "order_type": {
+            "type": "integer",
+            "description": "Order type: 1=Market Buy, 2=Market Sell, 3=Limit Buy, 4=Limit Sell, 5=Stop Limit Buy, 6=Stop Limit Sell"
+          },
+          "primary_asset": {
+            "type": "integer",
+            "description": "Primary (quote) asset ID"
+          },
+          "secondary_asset": {
+            "type": "integer",
+            "description": "Secondary (base) asset ID"
+          },
+          "quantity_asset": {
+            "type": "integer",
+            "description": "Asset ID for quantity"
+          },
+          "quantity": {
+            "type": "string",
+            "description": "Order quantity"
+          },
+          "trigger": {
+            "type": "string",
+            "description": "Trigger price (for limit/stop orders)"
+          },
+          "status": {
+            "type": "integer",
+            "description": "Order status: 1=New, 2=Cancelled, 3=Partially Filled, 4=Filled, 5=New (stop), 6=Cancelled (stop), 7=Rejected, 8=Cancelled, 9=Rejected"
+          },
+          "created_time": {
+            "type": "integer",
+            "description": "Creation timestamp in milliseconds"
+          },
+          "updated_time": {
+            "type": "integer",
+            "description": "Last update timestamp in milliseconds"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Filled amount"
+          },
+          "total": {
+            "type": "string",
+            "description": "Total value"
+          },
+          "rate": {
+            "type": "string",
+            "description": "Execution rate"
+          },
+          "feeAmount": {
+            "type": "string",
+            "description": "Fee amount"
+          },
+          "feeAsset": {
+            "type": "string",
+            "description": "Fee asset code"
+          }
+        }
+      },
+      "CreateOrderRequest": {
+        "type": "object",
+        "required": [
+          "primary",
+          "secondary",
+          "quantity",
+          "assetQuantity",
+          "orderType"
+        ],
+        "properties": {
+          "primary": {
+            "type": "string",
+            "description": "Primary (quote) asset code",
+            "example": "AUD"
+          },
+          "secondary": {
+            "type": "string",
+            "description": "Secondary (base) asset code",
+            "example": "BTC"
+          },
+          "quantity": {
+            "type": "string",
+            "description": "Order quantity",
+            "example": "0.001"
+          },
+          "assetQuantity": {
+            "type": "string",
+            "description": "Asset code for quantity (base for buy, quote for sell)",
+            "example": "BTC"
+          },
+          "orderType": {
+            "type": "string",
+            "description": "Order type: 1=Market Buy, 2=Market Sell, 3=Limit Buy, 4=Limit Sell",
+            "example": "3"
+          },
+          "trigger": {
+            "type": "string",
+            "description": "Trigger price for limit orders",
+            "example": "50000.00"
+          }
+        }
+      },
+      "OrderResponse": {
+        "type": "object",
+        "properties": {
+          "orderUuid": {
+            "type": "string",
+            "description": "Order UUID"
+          },
+          "order": {
+            "$ref": "#/components/schemas/Order"
+          }
+        }
+      },
+      "ExchangeRateRequest": {
+        "type": "object",
+        "required": [
+          "buy",
+          "sell",
+          "amount",
+          "limit"
+        ],
+        "properties": {
+          "buy": {
+            "type": "string",
+            "description": "Buy asset code",
+            "example": "BTC"
+          },
+          "sell": {
+            "type": "string",
+            "description": "Sell asset code",
+            "example": "AUD"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Amount to exchange",
+            "example": "100.0"
+          },
+          "limit": {
+            "type": "string",
+            "description": "Limit asset code (usually same as sell)",
+            "example": "AUD"
+          }
+        }
+      },
+      "ExchangeRateResponse": {
+        "type": "object",
+        "properties": {
+          "price": {
+            "type": "string",
+            "description": "Exchange rate price",
+            "example": "50000.00"
+          },
+          "total": {
+            "type": "string",
+            "description": "Total amount",
+            "example": "5000.00"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Amount",
+            "example": "0.1"
+          },
+          "feePerUnit": {
+            "type": "string",
+            "description": "Fee per unit",
+            "example": "0.001"
+          }
+        }
+      },
+      "RefreshTokenRequest": {
+        "type": "object",
+        "required": [
+          "apiKey"
+        ],
+        "properties": {
+          "apiKey": {
+            "type": "string",
+            "description": "API key from Swyftx profile",
+            "example": "your-api-key"
+          }
+        }
+      },
+      "RefreshTokenResponse": {
+        "type": "object",
+        "properties": {
+          "accessToken": {
+            "type": "string",
+            "description": "JWT access token (valid for 7 days)",
+            "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+          }
+        },
+        "required": [
+          "accessToken"
+        ]
+      },
+      "Balance": {
+        "type": "object",
+        "properties": {
+          "assetId": {
+            "type": "integer",
+            "description": "Asset ID",
+            "example": 1
+          },
+          "availableBalance": {
+            "type": "string",
+            "description": "Available balance",
+            "example": "1000.00"
+          },
+          "lockedBalance": {
+            "type": "string",
+            "description": "Locked balance (in orders)",
+            "example": "100.00"
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Bad request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Unauthorized - Invalid or missing JWT token",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "InternalServerError": {
+        "description": "Internal server error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
           }
         }
       }
