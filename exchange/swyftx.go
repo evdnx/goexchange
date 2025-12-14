@@ -974,13 +974,16 @@ func convertOrderBookEntries(entries []swyftxOrderBookEntry) []models.OrderBookE
 
 // GetCandles fetches OHLCV data using the Swyftx charts endpoint.
 // Based on Swyftx API docs: https://swyftx.docs.apiary.io/
-// Endpoint: /getbars/ with query parameters:
+// Endpoint: /getbars/ with query parameters (requires authentication):
 //   - baseAsset: Asset code (secondary asset)
 //   - secondaryAsset: Asset code (primary/quote asset)
-//   - resolution: Time span for candles
+//   - resolution: Time span for candles (in minutes)
 //   - side: "ask" or "bid"
-//   - timeStart: Start time (milliseconds)
+//   - timeStart: Start time (milliseconds, optional)
 //   - limit: Number of candles (max 20000)
+//
+// Note: If the standard endpoint returns 404, alternative paths are tried.
+// If all attempts fail, verify the endpoint with Swyftx API documentation.
 func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limit int) ([]models.Candle, error) {
 	ctx := context.Background()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
@@ -1010,12 +1013,52 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 	}
 
 	// Endpoint: /getbars/ with query parameters
-	path := fmt.Sprintf("/getbars/?%s", query.Encode())
-	data, err := c.doPublicRequest(ctx, http.MethodGet, path, nil)
+	// Note: This endpoint requires authentication per Swyftx API
+	// Try multiple endpoint variations in case the API has changed
 
-	// If public request fails, try with authentication
-	if err != nil {
+	// Try the standard endpoint first with authentication
+	// Try both with and without trailing slash, as API behavior may vary
+	paths := []string{
+		fmt.Sprintf("/getbars/?%s", query.Encode()),
+		fmt.Sprintf("/getbars?%s", query.Encode()),
+	}
+
+	var data []byte
+	for _, path := range paths {
 		data, err = c.doRequest(ctx, http.MethodGet, path, nil, true)
+		if err == nil {
+			break
+		}
+		// If it's not a 404, stop trying alternatives
+		if httpErr, ok := err.(*common.ExchangeError); !ok || httpErr.StatusCode != http.StatusNotFound {
+			break
+		}
+	}
+
+	// If that fails with 404, try alternative endpoint paths
+	if err != nil {
+		if httpErr, ok := err.(*common.ExchangeError); ok && httpErr.StatusCode == http.StatusNotFound {
+			// Try alternative endpoint paths
+			altPaths := []string{
+				fmt.Sprintf("/markets/getbars/?%s", query.Encode()),
+				fmt.Sprintf("/markets/getbars?%s", query.Encode()),
+				fmt.Sprintf("/charts/getbars/?%s", query.Encode()),
+				fmt.Sprintf("/charts/getbars?%s", query.Encode()),
+				fmt.Sprintf("/v1/getbars/?%s", query.Encode()),
+				fmt.Sprintf("/v1/getbars?%s", query.Encode()),
+			}
+
+			for _, altPath := range altPaths {
+				data, err = c.doRequest(ctx, http.MethodGet, altPath, nil, true)
+				if err == nil {
+					break
+				}
+				// If it's not a 404, stop trying alternatives
+				if httpErr, ok := err.(*common.ExchangeError); !ok || httpErr.StatusCode != http.StatusNotFound {
+					break
+				}
+			}
+		}
 	}
 
 	if err != nil {
