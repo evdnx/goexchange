@@ -21,19 +21,24 @@
   ],
   "tags": [
     {
-      "name": "Account"
+      "name": "Account",
+      "description": "User account information and settings"
     },
     {
-      "name": "Addresses"
+      "name": "Addresses",
+      "description": "Cryptocurrency deposit and withdrawal address management"
     },
     {
-      "name": "Alerts"
+      "name": "Alerts",
+      "description": "Price alert management"
     },
     {
-      "name": "Authentication"
+      "name": "Authentication",
+      "description": "Endpoints for API key management and JWT token refresh"
     },
     {
-      "name": "Charts"
+      "name": "Charts",
+      "description": "Market chart data"
     },
     {
       "name": "Charts v2 - DEPRECATED"
@@ -42,47 +47,56 @@
       "name": "Compare"
     },
     {
-      "name": "Earn"
+      "name": "Earn",
+      "description": "Earn program offerings and management"
     },
     {
       "name": "Errors"
     },
     {
-      "name": "Funds"
+      "name": "Funds",
+      "description": "Fund deposit and withdrawal operations"
     },
     {
-      "name": "History"
+      "name": "History",
+      "description": "Transaction and order history"
     },
     {
-      "name": "Info"
+      "name": "Info",
+      "description": "General API and platform information"
     },
     {
       "name": "Limits"
     },
     {
-      "name": "Markets"
+      "name": "Markets",
+      "description": "Market data including assets, rates, and trading pairs"
     },
     {
       "name": "Messages"
     },
     {
-      "name": "Orders"
+      "name": "Orders",
+      "description": "Order placement, management, and cancellation"
     },
     {
-      "name": "Portfolio"
+      "name": "Portfolio",
+      "description": "Portfolio analytics and asset history"
     },
     {
-      "name": "Recurring Orders"
+      "name": "Recurring Orders",
+      "description": "Automated recurring order management"
     },
     {
-      "name": "Swap"
+      "name": "Swap",
+      "description": "Cryptocurrency swap operations"
     }
   ],
   "paths": {
     "/auth/refresh/": {
       "post": {
         "summary": "Refresh",
-        "description": "This will invalidate the current access token, a new one can be generated with your API Key.",
+        "description": "Exchange your API key for a JWT access token. The access token is valid for 7 days and should be used in the Authorization header for authenticated requests. This endpoint does not require authentication.",
         "operationId": "post_auth_refresh",
         "tags": [
           "Authentication"
@@ -93,8 +107,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/RefreshTokenResponse"
+                },
+                "example": {
+                  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
                 }
               }
             }
@@ -145,8 +161,10 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "description": "Request body"
+                "$ref": "#/components/schemas/RefreshTokenRequest"
+              },
+              "example": {
+                "apiKey": "your-api-key-here"
               }
             }
           }
@@ -156,7 +174,7 @@
     "/auth/logout/": {
       "post": {
         "summary": "Logout",
-        "description": "",
+        "description": "Invalidate the current access token. After calling this endpoint, you will need to refresh your token using /auth/refresh/ to make further authenticated requests.",
         "operationId": "post_auth_logout",
         "tags": [
           "Authentication"
@@ -586,8 +604,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/UserProfile"
                 }
               }
             }
@@ -728,7 +745,32 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "description": "Request body"
+                "properties": {
+                  "firstName": {
+                    "type": "string"
+                  },
+                  "lastName": {
+                    "type": "string"
+                  },
+                  "phone": {
+                    "type": "string"
+                  },
+                  "address": {
+                    "type": "string"
+                  },
+                  "city": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "type": "string"
+                  },
+                  "postcode": {
+                    "type": "string"
+                  },
+                  "country": {
+                    "type": "string"
+                  }
+                }
               }
             }
           }
@@ -1428,8 +1470,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/BalanceList"
                 }
               }
             }
@@ -1477,24 +1518,12 @@
         },
         "parameters": [
           {
-            "name": "limit",
+            "name": "assetCode",
             "in": "query",
-            "description": "Number of results per page",
+            "description": "Filter by asset code (e.g., BTC, ETH)",
             "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 1000
-            }
-          },
-          {
-            "name": "page",
-            "in": "query",
-            "description": "Page number (1-based)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1
+              "type": "string"
             }
           }
         ],
@@ -2235,8 +2264,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/DepositAddress"
                 }
               }
             }
@@ -2284,24 +2312,13 @@
         },
         "parameters": [
           {
-            "name": "limit",
+            "name": "assetCode",
             "in": "query",
-            "description": "Number of results per page",
-            "required": false,
+            "required": true,
+            "description": "Asset code to get deposit address for",
             "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 1000
-            }
-          },
-          {
-            "name": "page",
-            "in": "query",
-            "description": "Page number (1-based)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1
+              "type": "string",
+              "example": "BTC"
             }
           }
         ],
@@ -2821,8 +2838,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PriceAlert"
+                  }
                 }
               }
             }
@@ -2963,7 +2982,28 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "description": "Request body"
+                "required": [
+                  "pair",
+                  "price",
+                  "direction"
+                ],
+                "properties": {
+                  "pair": {
+                    "type": "string",
+                    "example": "BTC-AUD"
+                  },
+                  "price": {
+                    "type": "string",
+                    "example": "50000.00"
+                  },
+                  "direction": {
+                    "type": "string",
+                    "enum": [
+                      "above",
+                      "below"
+                    ]
+                  }
+                }
               }
             }
           }
@@ -3039,6 +3079,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Alert ID",
+            "schema": {
+              "type": "integer"
+            }
           }
         ]
       }
@@ -3967,8 +4018,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EarnOffering"
+                  }
                 }
               }
             }
@@ -4435,6 +4488,44 @@
         },
         "parameters": [
           {
+            "name": "assetCode",
+            "in": "query",
+            "description": "Filter by asset code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Start date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "End date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "description": "Number of results per page",
@@ -4442,7 +4533,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 50
             }
           },
           {
@@ -4452,7 +4544,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -4696,6 +4789,44 @@
         },
         "parameters": [
           {
+            "name": "assetCode",
+            "in": "query",
+            "description": "Filter by asset code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Start date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "End date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "description": "Number of results per page",
@@ -4703,7 +4834,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 50
             }
           },
           {
@@ -4713,7 +4845,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -4787,6 +4920,44 @@
         },
         "parameters": [
           {
+            "name": "assetCode",
+            "in": "query",
+            "description": "Filter by asset code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Start date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "End date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "description": "Number of results per page",
@@ -4794,7 +4965,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 50
             }
           },
           {
@@ -4804,7 +4976,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -4878,6 +5051,44 @@
         },
         "parameters": [
           {
+            "name": "assetCode",
+            "in": "query",
+            "description": "Filter by asset code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Start date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "End date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "description": "Number of results per page",
@@ -4885,7 +5096,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 50
             }
           },
           {
@@ -4895,7 +5107,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -4969,6 +5182,44 @@
         },
         "parameters": [
           {
+            "name": "assetCode",
+            "in": "query",
+            "description": "Filter by asset code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Start date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "End date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "description": "Number of results per page",
@@ -4976,7 +5227,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 50
             }
           },
           {
@@ -4986,7 +5238,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -5011,8 +5264,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/TransactionList"
                 }
               }
             }
@@ -5060,6 +5312,44 @@
         },
         "parameters": [
           {
+            "name": "assetCode",
+            "in": "query",
+            "description": "Filter by asset code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Start date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "End date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "description": "Number of results per page",
@@ -5067,7 +5357,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 50
             }
           },
           {
@@ -5077,7 +5368,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -5091,7 +5383,7 @@
     "/history/affiliate/": {
       "get": {
         "summary": "Get Affiliate Payout History",
-        "description": "",
+        "description": "Retrieve transaction history including deposits, withdrawals, and trades. Supports filtering by asset, type, and date range.",
         "operationId": "get_history_affiliate",
         "tags": [
           "History"
@@ -5151,6 +5443,44 @@
         },
         "parameters": [
           {
+            "name": "assetCode",
+            "in": "query",
+            "description": "Filter by asset code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by transaction type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "startDate",
+            "in": "query",
+            "description": "Start date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "endDate",
+            "in": "query",
+            "description": "End date (ISO 8601 format)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "description": "Number of results per page",
@@ -5158,7 +5488,8 @@
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 1000
+              "maximum": 1000,
+              "default": 50
             }
           },
           {
@@ -5168,7 +5499,8 @@
             "required": false,
             "schema": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 1,
+              "default": 1
             }
           }
         ],
@@ -5370,8 +5702,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/LiveRateList"
                 }
               }
             }
@@ -5419,24 +5750,12 @@
         },
         "parameters": [
           {
-            "name": "limit",
+            "name": "pair",
             "in": "query",
-            "description": "Number of results per page",
+            "description": "Filter by trading pair (e.g., BTC-AUD)",
             "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 1000
-            }
-          },
-          {
-            "name": "page",
-            "in": "query",
-            "description": "Page number (1-based)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1
+              "type": "string"
             }
           }
         ],
@@ -5461,8 +5780,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/AssetList"
                 }
               }
             }
@@ -5510,24 +5828,25 @@
         },
         "parameters": [
           {
-            "name": "limit",
+            "name": "type",
             "in": "query",
-            "description": "Number of results per page",
+            "description": "Filter by asset type (crypto, fiat)",
             "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 1000
+              "type": "string",
+              "enum": [
+                "crypto",
+                "fiat"
+              ]
             }
           },
           {
-            "name": "page",
+            "name": "status",
             "in": "query",
-            "description": "Page number (1-based)",
+            "description": "Filter by asset status",
             "required": false,
             "schema": {
-              "type": "integer",
-              "minimum": 1
+              "type": "string"
             }
           }
         ],
@@ -6153,8 +6472,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/Order"
                 }
               }
             }
@@ -6205,8 +6523,14 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "description": "Request body"
+                "$ref": "#/components/schemas/OrderRequest"
+              },
+              "example": {
+                "primaryCurrencyCode": "BTC",
+                "secondaryCurrencyCode": "AUD",
+                "type": "Buy",
+                "amount": "0.001",
+                "orderType": "Market"
               }
             }
           }
@@ -6307,8 +6631,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/OrderList"
                 }
               }
             }
@@ -6356,22 +6679,40 @@
         },
         "parameters": [
           {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by order status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pair",
+            "in": "query",
+            "description": "Filter by trading pair",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
-            "required": false,
             "description": "Number of results per page",
+            "required": false,
             "schema": {
               "type": "integer",
               "minimum": 1,
               "maximum": 1000,
-              "default": 100
+              "default": 50
             }
           },
           {
             "name": "page",
             "in": "query",
-            "required": false,
             "description": "Page number (1-based)",
+            "required": false,
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -6547,8 +6888,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "description": "Response data"
+                  "$ref": "#/components/schemas/Order"
                 }
               }
             }
@@ -6596,24 +6936,12 @@
         },
         "parameters": [
           {
-            "name": "limit",
-            "in": "query",
-            "description": "Number of results per page",
-            "required": false,
+            "name": "orderUuid",
+            "in": "path",
+            "required": true,
+            "description": "Order UUID",
             "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 1000
-            }
-          },
-          {
-            "name": "page",
-            "in": "query",
-            "description": "Page number (1-based)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1
+              "type": "string"
             }
           }
         ],
@@ -6912,7 +7240,14 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Response data"
+                  "properties": {
+                    "orders": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RecurringOrder"
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -7053,7 +7388,35 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "description": "Request body"
+                "required": [
+                  "primaryCurrencyCode",
+                  "secondaryCurrencyCode",
+                  "type",
+                  "amount",
+                  "frequency"
+                ],
+                "properties": {
+                  "primaryCurrencyCode": {
+                    "type": "string"
+                  },
+                  "secondaryCurrencyCode": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "Buy",
+                      "Sell"
+                    ]
+                  },
+                  "amount": {
+                    "type": "string"
+                  },
+                  "frequency": {
+                    "type": "string",
+                    "description": "Recurrence frequency (daily, weekly, monthly)"
+                  }
+                }
               }
             }
           }
@@ -7221,6 +7584,17 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Recurring order ID",
+            "schema": {
+              "type": "integer"
+            }
+          }
         ]
       }
     },
@@ -7290,8 +7664,12 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "description": "Request body"
+                "$ref": "#/components/schemas/SwapRequest"
+              },
+              "example": {
+                "fromAssetCode": "BTC",
+                "toAssetCode": "ETH",
+                "amount": "0.1"
               }
             }
           }
@@ -7407,14 +7785,607 @@
     "schemas": {
       "Error": {
         "type": "object",
+        "required": [
+          "error"
+        ],
         "properties": {
           "error": {
             "type": "string",
-            "description": "Error message"
+            "description": "Error message describing what went wrong"
           },
           "code": {
             "type": "integer",
-            "description": "Error code"
+            "description": "HTTP status code or application error code"
+          },
+          "message": {
+            "type": "string",
+            "description": "Additional error details"
+          }
+        },
+        "example": {
+          "error": "Invalid API key",
+          "code": 401,
+          "message": "The provided API key is invalid or expired"
+        }
+      },
+      "RefreshTokenRequest": {
+        "type": "object",
+        "required": [
+          "apiKey"
+        ],
+        "properties": {
+          "apiKey": {
+            "type": "string",
+            "description": "Your Swyftx API key",
+            "example": "your-api-key-here"
+          }
+        }
+      },
+      "RefreshTokenResponse": {
+        "type": "object",
+        "required": [
+          "accessToken"
+        ],
+        "properties": {
+          "accessToken": {
+            "type": "string",
+            "description": "JWT access token valid for 7 days",
+            "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+          }
+        }
+      },
+      "UserProfile": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "User ID"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "description": "User email address"
+          },
+          "firstName": {
+            "type": "string",
+            "description": "First name"
+          },
+          "lastName": {
+            "type": "string",
+            "description": "Last name"
+          },
+          "phone": {
+            "type": "string",
+            "description": "Phone number"
+          },
+          "dateOfBirth": {
+            "type": "string",
+            "format": "date",
+            "description": "Date of birth"
+          },
+          "country": {
+            "type": "string",
+            "description": "Country code"
+          },
+          "state": {
+            "type": "string",
+            "description": "State/Province"
+          },
+          "postcode": {
+            "type": "string",
+            "description": "Postal code"
+          },
+          "address": {
+            "type": "string",
+            "description": "Street address"
+          },
+          "city": {
+            "type": "string",
+            "description": "City"
+          },
+          "verificationStatus": {
+            "type": "string",
+            "description": "Account verification status"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Account creation timestamp"
+          }
+        }
+      },
+      "Balance": {
+        "type": "object",
+        "properties": {
+          "assetId": {
+            "type": "integer",
+            "description": "Asset ID"
+          },
+          "assetCode": {
+            "type": "string",
+            "description": "Asset code (e.g., BTC, ETH)"
+          },
+          "available": {
+            "type": "string",
+            "description": "Available balance"
+          },
+          "locked": {
+            "type": "string",
+            "description": "Locked balance"
+          },
+          "total": {
+            "type": "string",
+            "description": "Total balance"
+          },
+          "fiatValue": {
+            "type": "string",
+            "description": "Fiat value of the balance"
+          }
+        }
+      },
+      "BalanceList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Balance"
+        }
+      },
+      "Asset": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Asset ID"
+          },
+          "code": {
+            "type": "string",
+            "description": "Asset code (e.g., BTC, ETH)"
+          },
+          "name": {
+            "type": "string",
+            "description": "Asset name"
+          },
+          "type": {
+            "type": "string",
+            "description": "Asset type (crypto, fiat)"
+          },
+          "status": {
+            "type": "string",
+            "description": "Asset status"
+          },
+          "decimals": {
+            "type": "integer",
+            "description": "Number of decimal places"
+          },
+          "minOrderSize": {
+            "type": "string",
+            "description": "Minimum order size"
+          },
+          "maxOrderSize": {
+            "type": "string",
+            "description": "Maximum order size"
+          },
+          "withdrawalFee": {
+            "type": "string",
+            "description": "Withdrawal fee"
+          },
+          "depositFee": {
+            "type": "string",
+            "description": "Deposit fee"
+          }
+        }
+      },
+      "AssetList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Asset"
+        }
+      },
+      "LiveRate": {
+        "type": "object",
+        "properties": {
+          "pair": {
+            "type": "string",
+            "description": "Trading pair (e.g., BTC-AUD)"
+          },
+          "bid": {
+            "type": "string",
+            "description": "Best bid price"
+          },
+          "ask": {
+            "type": "string",
+            "description": "Best ask price"
+          },
+          "last": {
+            "type": "string",
+            "description": "Last traded price"
+          },
+          "volume24h": {
+            "type": "string",
+            "description": "24-hour trading volume"
+          },
+          "change24h": {
+            "type": "string",
+            "description": "24-hour price change"
+          },
+          "change24hPercent": {
+            "type": "string",
+            "description": "24-hour price change percentage"
+          }
+        }
+      },
+      "LiveRateList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/LiveRate"
+        }
+      },
+      "OrderRequest": {
+        "type": "object",
+        "required": [
+          "primaryCurrencyCode",
+          "secondaryCurrencyCode",
+          "type",
+          "amount"
+        ],
+        "properties": {
+          "primaryCurrencyCode": {
+            "type": "string",
+            "description": "Primary currency code (e.g., BTC)",
+            "example": "BTC"
+          },
+          "secondaryCurrencyCode": {
+            "type": "string",
+            "description": "Secondary currency code (e.g., AUD)",
+            "example": "AUD"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "Buy",
+              "Sell"
+            ],
+            "description": "Order type"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Order amount",
+            "example": "0.001"
+          },
+          "price": {
+            "type": "string",
+            "description": "Limit price (required for limit orders)",
+            "example": "50000.00"
+          },
+          "orderType": {
+            "type": "string",
+            "enum": [
+              "Market",
+              "Limit"
+            ],
+            "description": "Order execution type",
+            "default": "Market"
+          }
+        }
+      },
+      "Order": {
+        "type": "object",
+        "properties": {
+          "orderUuid": {
+            "type": "string",
+            "description": "Unique order identifier"
+          },
+          "primaryCurrencyCode": {
+            "type": "string",
+            "description": "Primary currency"
+          },
+          "secondaryCurrencyCode": {
+            "type": "string",
+            "description": "Secondary currency"
+          },
+          "type": {
+            "type": "string",
+            "description": "Order type (Buy/Sell)"
+          },
+          "orderType": {
+            "type": "string",
+            "description": "Order execution type (Market/Limit)"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Order amount"
+          },
+          "price": {
+            "type": "string",
+            "description": "Order price"
+          },
+          "status": {
+            "type": "string",
+            "description": "Order status"
+          },
+          "filled": {
+            "type": "string",
+            "description": "Filled amount"
+          },
+          "remaining": {
+            "type": "string",
+            "description": "Remaining amount"
+          },
+          "fee": {
+            "type": "string",
+            "description": "Order fee"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Order creation timestamp"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Order update timestamp"
+          }
+        }
+      },
+      "OrderList": {
+        "type": "object",
+        "properties": {
+          "orders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Order"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total number of orders"
+          },
+          "page": {
+            "type": "integer",
+            "description": "Current page number"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Results per page"
+          }
+        }
+      },
+      "DepositAddress": {
+        "type": "object",
+        "properties": {
+          "assetCode": {
+            "type": "string",
+            "description": "Asset code"
+          },
+          "address": {
+            "type": "string",
+            "description": "Deposit address"
+          },
+          "tag": {
+            "type": "string",
+            "description": "Memo/tag for certain assets"
+          },
+          "network": {
+            "type": "string",
+            "description": "Blockchain network"
+          }
+        }
+      },
+      "WithdrawalAddress": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Address ID"
+          },
+          "assetCode": {
+            "type": "string",
+            "description": "Asset code"
+          },
+          "address": {
+            "type": "string",
+            "description": "Withdrawal address"
+          },
+          "tag": {
+            "type": "string",
+            "description": "Memo/tag"
+          },
+          "network": {
+            "type": "string",
+            "description": "Blockchain network"
+          },
+          "label": {
+            "type": "string",
+            "description": "Address label"
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Whether address is verified"
+          }
+        }
+      },
+      "Transaction": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Transaction ID"
+          },
+          "type": {
+            "type": "string",
+            "description": "Transaction type"
+          },
+          "assetCode": {
+            "type": "string",
+            "description": "Asset code"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Transaction amount"
+          },
+          "fee": {
+            "type": "string",
+            "description": "Transaction fee"
+          },
+          "status": {
+            "type": "string",
+            "description": "Transaction status"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Transaction timestamp"
+          },
+          "address": {
+            "type": "string",
+            "description": "Transaction address"
+          },
+          "txHash": {
+            "type": "string",
+            "description": "Transaction hash"
+          }
+        }
+      },
+      "TransactionList": {
+        "type": "object",
+        "properties": {
+          "transactions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Transaction"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total number of transactions"
+          },
+          "page": {
+            "type": "integer",
+            "description": "Current page number"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Results per page"
+          }
+        }
+      },
+      "RecurringOrder": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Recurring order ID"
+          },
+          "primaryCurrencyCode": {
+            "type": "string",
+            "description": "Primary currency"
+          },
+          "secondaryCurrencyCode": {
+            "type": "string",
+            "description": "Secondary currency"
+          },
+          "type": {
+            "type": "string",
+            "description": "Order type (Buy/Sell)"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Order amount"
+          },
+          "frequency": {
+            "type": "string",
+            "description": "Recurrence frequency"
+          },
+          "nextExecution": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Next execution time"
+          },
+          "status": {
+            "type": "string",
+            "description": "Recurring order status"
+          }
+        }
+      },
+      "PriceAlert": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "Alert ID"
+          },
+          "pair": {
+            "type": "string",
+            "description": "Trading pair"
+          },
+          "price": {
+            "type": "string",
+            "description": "Target price"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "above",
+              "below"
+            ],
+            "description": "Price direction"
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Whether alert is active"
+          }
+        }
+      },
+      "SwapRequest": {
+        "type": "object",
+        "required": [
+          "fromAssetCode",
+          "toAssetCode",
+          "amount"
+        ],
+        "properties": {
+          "fromAssetCode": {
+            "type": "string",
+            "description": "Source asset code",
+            "example": "BTC"
+          },
+          "toAssetCode": {
+            "type": "string",
+            "description": "Destination asset code",
+            "example": "ETH"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Amount to swap",
+            "example": "0.1"
+          }
+        }
+      },
+      "EarnOffering": {
+        "type": "object",
+        "properties": {
+          "assetCode": {
+            "type": "string",
+            "description": "Asset code"
+          },
+          "apy": {
+            "type": "string",
+            "description": "Annual percentage yield"
+          },
+          "minDeposit": {
+            "type": "string",
+            "description": "Minimum deposit amount"
+          },
+          "maxDeposit": {
+            "type": "string",
+            "description": "Maximum deposit amount"
+          },
+          "term": {
+            "type": "string",
+            "description": "Term length"
+          },
+          "status": {
+            "type": "string",
+            "description": "Offering status"
           }
         }
       }
