@@ -1652,3 +1652,587 @@ type SwyftxMarketDetail struct {
 		Max         float64 `json:"max"`
 	} `json:"supply"`
 }
+
+// ============================================================================
+// Address Management Methods
+// ============================================================================
+
+// GetDepositAddress retrieves active deposit addresses for an asset.
+// Based on Swyftx OpenAPI spec: GET /address/deposit
+func (c *SwyftxClient) GetDepositAddress(assetID string, networkID int) (map[string]interface{}, error) {
+	ctx := context.Background()
+	query := url.Values{}
+	query.Set("assetId", assetID)
+	query.Set("networkId", strconv.Itoa(networkID))
+	path := fmt.Sprintf("/address/deposit?%s", query.Encode())
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// CreateWithdrawAddress creates a new withdrawal address for an asset.
+// Based on Swyftx OpenAPI spec: POST /address/withdraw/{assetCode}
+func (c *SwyftxClient) CreateWithdrawAddress(assetCode string, address map[string]interface{}) (map[string]interface{}, error) {
+	ctx := context.Background()
+	path := fmt.Sprintf("/address/withdraw/%s", strings.ToUpper(assetCode))
+	body := map[string]interface{}{"address": address}
+	data, err := c.doRequest(ctx, http.MethodPost, path, body, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// RemoveWithdrawAddress removes a withdrawal address.
+// Based on Swyftx OpenAPI spec: POST /address/withdraw/{addressId}
+func (c *SwyftxClient) RemoveWithdrawAddress(addressID int) error {
+	ctx := context.Background()
+	path := fmt.Sprintf("/address/withdraw/%d", addressID)
+	_, err := c.doRequest(ctx, http.MethodPost, path, nil, true)
+	return err
+}
+
+// VerifyWithdrawAddress verifies a withdrawal address using a token from email.
+// Based on Swyftx OpenAPI spec: POST /address/withdraw/verify/{token}
+func (c *SwyftxClient) VerifyWithdrawAddress(token string) error {
+	ctx := context.Background()
+	path := fmt.Sprintf("/address/withdraw/verify/%s", token)
+	_, err := c.doRequest(ctx, http.MethodPost, path, nil, true)
+	return err
+}
+
+// VerifyBSB verifies a BSB (Bank State Branch) number.
+// Based on Swyftx OpenAPI spec: GET /address/withdraw/bsb-verify/{bsb}
+func (c *SwyftxClient) VerifyBSB(bsb string) (map[string]interface{}, error) {
+	ctx := context.Background()
+	path := fmt.Sprintf("/address/withdraw/bsb-verify/%s", bsb)
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ============================================================================
+// Withdrawal Methods
+// ============================================================================
+
+// RequestWithdrawal requests a withdrawal of funds.
+// Based on Swyftx OpenAPI spec: GET /funds/withdraw/{assetCode}
+func (c *SwyftxClient) RequestWithdrawal(assetCode string, quantity string, addressID int, reason interface{}) (map[string]interface{}, error) {
+	ctx := context.Background()
+	path := fmt.Sprintf("/funds/withdraw/%s", strings.ToUpper(assetCode))
+	body := map[string]interface{}{
+		"quantity":   quantity,
+		"address_id": addressID,
+	}
+	if reason != nil {
+		body["reason"] = reason
+	}
+	data, err := c.doRequest(ctx, http.MethodGet, path, body, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetWithdrawalPermissions checks withdrawal permissions for an asset.
+// Based on Swyftx OpenAPI spec: GET /funds/withdrawalPermissions/{assetCode}
+func (c *SwyftxClient) GetWithdrawalPermissions(assetCode string) (*SwyftxWithdrawalPermissions, error) {
+	ctx := context.Background()
+	path := fmt.Sprintf("/funds/withdrawalPermissions/%s", strings.ToUpper(assetCode))
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp SwyftxWithdrawalPermissions
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SwyftxWithdrawalPermissions represents withdrawal permissions from the Swyftx API.
+type SwyftxWithdrawalPermissions struct {
+	CanWithdraw bool   `json:"canWithdraw"`
+	Message     string `json:"message"`
+}
+
+// GetWithdrawalLimits retrieves withdrawal limits.
+// Based on Swyftx OpenAPI spec: GET /limits/withdrawal
+func (c *SwyftxClient) GetWithdrawalLimits() (*SwyftxWithdrawalLimits, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodGet, "/limits/withdrawal", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp SwyftxWithdrawalLimits
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SwyftxWithdrawalLimits represents withdrawal limits from the Swyftx API.
+type SwyftxWithdrawalLimits struct {
+	Used          float64 `json:"used"`
+	Remaining     float64 `json:"remaining"`
+	Limit         float64 `json:"limit"`
+	RollingCycleHrs int   `json:"rollingCycleHrs"`
+}
+
+// ============================================================================
+// History Methods
+// ============================================================================
+
+// GetDepositHistory retrieves deposit history for an asset.
+// Based on Swyftx OpenAPI spec: GET /history/deposit/{asset}
+func (c *SwyftxClient) GetDepositHistory(asset string, limit, page int) ([]map[string]interface{}, error) {
+	ctx := context.Background()
+	query := url.Values{}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if page > 0 {
+		query.Set("page", strconv.Itoa(page))
+	}
+	path := fmt.Sprintf("/history/deposit/%s", strings.ToUpper(asset))
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetWithdrawHistory retrieves withdrawal history for an asset.
+// Based on Swyftx OpenAPI spec: GET /history/withdraw/{asset}
+func (c *SwyftxClient) GetWithdrawHistory(asset string, limit, page int) ([]map[string]interface{}, error) {
+	ctx := context.Background()
+	query := url.Values{}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if page > 0 {
+		query.Set("page", strconv.Itoa(page))
+	}
+	path := fmt.Sprintf("/history/withdraw/%s", strings.ToUpper(asset))
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetAllHistory retrieves all history for a specific type and asset.
+// Based on Swyftx OpenAPI spec: GET /history/all/{type}/{assetId}
+func (c *SwyftxClient) GetAllHistory(historyType string, assetID int, limit, page int) ([]map[string]interface{}, error) {
+	ctx := context.Background()
+	query := url.Values{}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if page > 0 {
+		query.Set("page", strconv.Itoa(page))
+	}
+	path := fmt.Sprintf("/history/all/%s/%d", historyType, assetID)
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ============================================================================
+// Rate Methods
+// ============================================================================
+
+// GetMultiRates retrieves exchange rates for multiple pairs.
+// Based on Swyftx OpenAPI spec: POST /orders/rate/multi
+func (c *SwyftxClient) GetMultiRates(rateRequests []map[string]string) ([]map[string]interface{}, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodPost, "/orders/rate/multi", rateRequests, false)
+	if err != nil {
+		return nil, err
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetSwapRate retrieves the exchange rate for a swap pair.
+// Based on Swyftx OpenAPI spec: POST /orders/rate/swap
+func (c *SwyftxClient) GetSwapRate(buy, sell, amount, limit string, intermediary string) (*swyftxRateResponse, error) {
+	ctx := context.Background()
+	body := map[string]string{
+		"buy":    strings.ToUpper(buy),
+		"sell":   strings.ToUpper(sell),
+		"amount": amount,
+		"limit":  strings.ToUpper(limit),
+	}
+	if intermediary != "" {
+		body["intermediary"] = strings.ToUpper(intermediary)
+	}
+	data, err := c.doRequest(ctx, http.MethodPost, "/orders/rate/swap", body, false)
+	if err != nil {
+		return nil, err
+	}
+	var resp swyftxRateResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ExecuteSwap executes a swap between two assets.
+// Based on Swyftx OpenAPI spec: POST /swap
+func (c *SwyftxClient) ExecuteSwap(buy, sell string, limitAsset int, limitQty string, intermediateAssetID string) (map[string]interface{}, error) {
+	ctx := context.Background()
+	body := map[string]interface{}{
+		"buy":       buy,
+		"sell":      sell,
+		"limitAsset": limitAsset,
+		"limitQty":  limitQty,
+	}
+	if intermediateAssetID != "" {
+		body["intermediateAssetId"] = intermediateAssetID
+	}
+	data, err := c.doRequest(ctx, http.MethodPost, "/swap", body, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ============================================================================
+// User Management Methods
+// ============================================================================
+
+// GetAPIKeys retrieves all API keys for the user.
+// Based on Swyftx OpenAPI spec: GET /user/apiKeys
+func (c *SwyftxClient) GetAPIKeys() ([]SwyftxAPIKey, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodGet, "/user/apiKeys", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp []SwyftxAPIKey
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// SwyftxAPIKey represents an API key from the Swyftx API.
+type SwyftxAPIKey struct {
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	Scope   string `json:"scope"`
+	Created string `json:"created"`
+}
+
+// RevokeAPIKey revokes a specific API key.
+// Based on Swyftx OpenAPI spec: POST /user/apiKeys/revoke
+func (c *SwyftxClient) RevokeAPIKey(keyID string) error {
+	ctx := context.Background()
+	body := map[string]string{"keyId": keyID}
+	_, err := c.doRequest(ctx, http.MethodPost, "/user/apiKeys/revoke", body, true)
+	return err
+}
+
+// RevokeAllAPIKeys revokes all API keys.
+// Based on Swyftx OpenAPI spec: POST /user/apiKeys/revokeAll
+func (c *SwyftxClient) RevokeAllAPIKeys() error {
+	ctx := context.Background()
+	_, err := c.doRequest(ctx, http.MethodPost, "/user/apiKeys/revokeAll", nil, true)
+	return err
+}
+
+// GetAPIKeyScopes retrieves available API key scopes.
+// Based on Swyftx OpenAPI spec: GET /user/apiKeys/scope
+func (c *SwyftxClient) GetAPIKeyScopes() (map[string]interface{}, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodGet, "/user/apiKeys/scope", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// UpdateUserSettings updates user account settings.
+// Based on Swyftx OpenAPI spec: POST /user/settings
+func (c *SwyftxClient) UpdateUserSettings(settings map[string]interface{}) (*SwyftxUserProfile, error) {
+	ctx := context.Background()
+	body := map[string]interface{}{"data": settings}
+	data, err := c.doRequest(ctx, http.MethodPost, "/user/settings", body, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Profile SwyftxUserProfile `json:"profile"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp.Profile, nil
+}
+
+// GetUserStatistics retrieves user statistics.
+// Based on Swyftx OpenAPI spec: GET /user/statistics
+func (c *SwyftxClient) GetUserStatistics() (*SwyftxUserStatistics, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodGet, "/user/statistics", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp SwyftxUserStatistics
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SwyftxUserStatistics represents user statistics from the Swyftx API.
+type SwyftxUserStatistics struct {
+	Orders    int     `json:"orders"`
+	Traded    float64 `json:"traded"`
+	Deposited float64 `json:"deposited"`
+	Withdrawn float64 `json:"withdrawn"`
+}
+
+// GetUserAffiliations retrieves user affiliation information.
+// Based on Swyftx OpenAPI spec: GET /user/affiliations
+func (c *SwyftxClient) GetUserAffiliations(forceRefresh bool) (*SwyftxUserAffiliations, error) {
+	ctx := context.Background()
+	query := url.Values{}
+	if forceRefresh {
+		query.Set("forceRefresh", "true")
+	}
+	path := "/user/affiliations"
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp SwyftxUserAffiliations
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SwyftxUserAffiliations represents user affiliations from the Swyftx API.
+type SwyftxUserAffiliations struct {
+	ReferralLink      string  `json:"referral_link"`
+	ReferredUsers     int     `json:"referred_users"`
+	OutstandingBalance float64 `json:"outstandingBalance"`
+}
+
+// ConvertDust converts small balances (dust) to a primary asset.
+// Based on Swyftx OpenAPI spec: POST /user/balance/dust
+func (c *SwyftxClient) ConvertDust(selectedAssetIDs []int, primaryAssetID int) ([]map[string]interface{}, error) {
+	ctx := context.Background()
+	body := map[string]interface{}{
+		"selected": selectedAssetIDs,
+		"primary":  primaryAssetID,
+	}
+	data, err := c.doRequest(ctx, http.MethodPost, "/user/balance/dust", body, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// SetUserCurrency sets the user's default currency.
+// Based on Swyftx OpenAPI spec: POST /user/currency
+func (c *SwyftxClient) SetUserCurrency(assetID int) (*SwyftxUserProfile, error) {
+	ctx := context.Background()
+	body := map[string]interface{}{
+		"profile": map[string]interface{}{
+			"defaultAsset": assetID,
+		},
+	}
+	data, err := c.doRequest(ctx, http.MethodPost, "/user/currency", body, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Profile SwyftxUserProfile `json:"profile"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp.Profile, nil
+}
+
+// ============================================================================
+// Portfolio Methods
+// ============================================================================
+
+// GetTradePriceHistory retrieves trade price history for an asset.
+// Based on Swyftx OpenAPI spec: GET /portfolio/tradePriceHistory/{denotedAssetId}
+func (c *SwyftxClient) GetTradePriceHistory(denotedAssetID string) (map[string]interface{}, error) {
+	ctx := context.Background()
+	path := fmt.Sprintf("/portfolio/tradePriceHistory/%s", denotedAssetID)
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetAllAssetHistory retrieves all asset history with pagination.
+// Based on Swyftx OpenAPI spec: GET /portfolio/assetHistory/all
+func (c *SwyftxClient) GetAllAssetHistory(page, limit int, sortKey, sortDirection string) ([]map[string]interface{}, error) {
+	ctx := context.Background()
+	query := url.Values{}
+	query.Set("page", strconv.Itoa(page))
+	query.Set("limit", strconv.Itoa(limit))
+	if sortKey != "" {
+		query.Set("sortKey", sortKey)
+	}
+	if sortDirection != "" {
+		query.Set("sortDirection", sortDirection)
+	}
+	path := fmt.Sprintf("/portfolio/assetHistory/all?%s", query.Encode())
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp []map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ============================================================================
+// Utility Methods
+// ============================================================================
+
+// GetLiveRates retrieves live rates for all assets in a specific currency.
+// Based on Swyftx OpenAPI spec: GET /live-rates/{asset}
+func (c *SwyftxClient) GetLiveRates(assetID string) (map[string]interface{}, error) {
+	ctx := context.Background()
+	path := fmt.Sprintf("/live-rates/%s", assetID)
+	data, err := c.doPublicRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetChartSettings retrieves chart settings.
+// Based on Swyftx OpenAPI spec: GET /charts/v2/settings
+func (c *SwyftxClient) GetChartSettings() (map[string]interface{}, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodGet, "/charts/v2/settings", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ResolveSymbol resolves a symbol and returns symbol information.
+// Based on Swyftx OpenAPI spec: GET /charts/v2/resolveSymbol/{baseAsset}/{secondaryAsset}
+func (c *SwyftxClient) ResolveSymbol(symbol string) (map[string]interface{}, error) {
+	ctx := context.Background()
+	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/charts/v2/resolveSymbol/%s/%s",
+		strings.ToUpper(quoteAsset.Code), // baseAsset in API = quote
+		strings.ToUpper(baseAsset.Code))  // secondaryAsset in API = base
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// Logout logs out the current session.
+// Based on Swyftx OpenAPI spec: POST /auth/logout
+func (c *SwyftxClient) Logout() error {
+	ctx := context.Background()
+	_, err := c.doRequest(ctx, http.MethodPost, "/auth/logout", nil, true)
+	if err != nil {
+		return err
+	}
+	// Clear cached token on logout
+	c.tokenMu.Lock()
+	c.accessToken = ""
+	c.tokenExpiry = time.Time{}
+	c.tokenMu.Unlock()
+	return nil
+}
