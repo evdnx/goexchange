@@ -214,7 +214,10 @@ func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path strin
 		headers["Authorization"] = "Bearer " + token
 	}
 	fullURL := strings.TrimRight(baseURL, "/") + path
-	opts := headerOptions(headers)
+	opts := make([]gohttpcl.ReqOption, 0, len(headers))
+	for k, v := range headers {
+		opts = append(opts, gohttpcl.WithHeader(k, v))
+	}
 	var resp *http.Response
 	var err error
 	switch method {
@@ -972,18 +975,16 @@ func convertOrderBookEntries(entries []swyftxOrderBookEntry) []models.OrderBookE
 	return result
 }
 
-// GetCandles fetches OHLCV data using the Swyftx charts endpoint.
-// Based on Swyftx API docs: https://swyftx.docs.apiary.io/
-// Endpoint: /getbars/ with query parameters (requires authentication):
-//   - baseAsset: Asset code (secondary asset)
-//   - secondaryAsset: Asset code (primary/quote asset)
-//   - resolution: Time span for candles (in minutes)
+// GetCandles fetches OHLCV data using the Swyftx charts v2 endpoint.
+// Based on Swyftx OpenAPI spec: /charts/v2/getBars/{baseAsset}/{secondaryAsset}/{side}
+// Parameters:
+//   - baseAsset: Asset code (secondary asset/base)
+//   - secondaryAsset: Asset code (primary asset/quote)
 //   - side: "ask" or "bid"
-//   - timeStart: Start time (milliseconds, optional)
-//   - limit: Number of candles (max 20000)
-//
-// Note: If the standard endpoint returns 404, alternative paths are tried.
-// If all attempts fail, verify the endpoint with Swyftx API documentation.
+//   - resolution: Time span for candles (e.g., "1m", "5m", "1h")
+//   - timeStart: Start time (milliseconds, required)
+//   - timeEnd: End time (milliseconds, required)
+//   - limit: Number of candles (max 10000, optional)
 func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limit int) ([]models.Candle, error) {
 	ctx := context.Background()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
@@ -997,70 +998,34 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 	if limit <= 0 {
 		limit = 500
 	}
-	if limit > 20000 {
-		limit = 20000 // API maximum
+	if limit > 10000 {
+		limit = 10000 // API maximum per OpenAPI spec
 	}
 
-	// Build query parameters according to API docs
+	// Calculate timeStart and timeEnd
+	timeStart := since
+	if timeStart.IsZero() {
+		// Default to 24 hours ago if not specified
+		timeStart = time.Now().Add(-24 * time.Hour)
+	}
+	timeEnd := time.Now()
+
+	// Build query parameters according to OpenAPI spec
 	query := url.Values{}
-	query.Set("baseAsset", strings.ToUpper(baseAsset.Code))       // Secondary asset (base)
-	query.Set("secondaryAsset", strings.ToUpper(quoteAsset.Code)) // Primary asset (quote)
 	query.Set("resolution", strconv.Itoa(resolution))
-	query.Set("side", "bid") // Use "bid" for buy side
+	query.Set("timeStart", strconv.FormatInt(timeStart.Unix()*1000, 10))
+	query.Set("timeEnd", strconv.FormatInt(timeEnd.Unix()*1000, 10))
 	query.Set("limit", strconv.Itoa(limit))
-	if !since.IsZero() {
-		query.Set("timeStart", strconv.FormatInt(since.Unix()*1000, 10))
-	}
 
-	// Endpoint: /getbars/ with query parameters
-	// Note: This endpoint requires authentication per Swyftx API
-	// Try multiple endpoint variations in case the API has changed
+	// Use the OpenAPI v2 endpoint: /charts/v2/getBars/{baseAsset}/{secondaryAsset}/{side}
+	// Note: baseAsset in path is actually the quote (primary), secondaryAsset is the base
+	// This matches the OpenAPI spec where baseAsset is the quote currency
+	path := fmt.Sprintf("/charts/v2/getBars/%s/%s/bid?%s",
+		strings.ToUpper(quoteAsset.Code), // baseAsset in API = quote
+		strings.ToUpper(baseAsset.Code),  // secondaryAsset in API = base
+		query.Encode())
 
-	// Try the standard endpoint first with authentication
-	// Try both with and without trailing slash, as API behavior may vary
-	paths := []string{
-		fmt.Sprintf("/getbars/?%s", query.Encode()),
-		fmt.Sprintf("/getbars?%s", query.Encode()),
-	}
-
-	var data []byte
-	for _, path := range paths {
-		data, err = c.doRequest(ctx, http.MethodGet, path, nil, true)
-		if err == nil {
-			break
-		}
-		// If it's not a 404, stop trying alternatives
-		if httpErr, ok := err.(*common.ExchangeError); !ok || httpErr.StatusCode != http.StatusNotFound {
-			break
-		}
-	}
-
-	// If that fails with 404, try alternative endpoint paths
-	if err != nil {
-		if httpErr, ok := err.(*common.ExchangeError); ok && httpErr.StatusCode == http.StatusNotFound {
-			// Try alternative endpoint paths
-			altPaths := []string{
-				fmt.Sprintf("/markets/getbars/?%s", query.Encode()),
-				fmt.Sprintf("/markets/getbars?%s", query.Encode()),
-				fmt.Sprintf("/charts/getbars/?%s", query.Encode()),
-				fmt.Sprintf("/charts/getbars?%s", query.Encode()),
-				fmt.Sprintf("/v1/getbars/?%s", query.Encode()),
-				fmt.Sprintf("/v1/getbars?%s", query.Encode()),
-			}
-
-			for _, altPath := range altPaths {
-				data, err = c.doRequest(ctx, http.MethodGet, altPath, nil, true)
-				if err == nil {
-					break
-				}
-				// If it's not a 404, stop trying alternatives
-				if httpErr, ok := err.(*common.ExchangeError); !ok || httpErr.StatusCode != http.StatusNotFound {
-					break
-				}
-			}
-		}
-	}
-
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch candles for %s: %w", symbol, err)
 	}
@@ -1085,6 +1050,64 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 		})
 	}
 	return candles, nil
+}
+
+// GetLatestBar fetches the latest candle/bar for a symbol using the Swyftx charts v2 endpoint.
+// Based on Swyftx OpenAPI spec: /charts/v2/getLatestBar
+// Parameters:
+//   - symbol: Trading pair symbol (e.g., "BTC/AUD")
+//   - interval: Time interval (e.g., "1m", "5m", "1h")
+//   - side: "ask" or "bid" (defaults to "bid" if empty)
+func (c *SwyftxClient) GetLatestBar(symbol, interval, side string) (*models.Candle, error) {
+	ctx := context.Background()
+	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	resolution, err := swyftxResolution(interval)
+	if err != nil {
+		return nil, err
+	}
+	if side == "" {
+		side = "bid"
+	}
+	if side != "ask" && side != "bid" {
+		return nil, fmt.Errorf("side must be 'ask' or 'bid', got: %s", side)
+	}
+
+	// Build query parameters according to OpenAPI spec
+	query := url.Values{}
+	query.Set("baseAsset", strings.ToUpper(quoteAsset.Code)) // baseAsset in API = quote
+	query.Set("secondaryAsset", strings.ToUpper(baseAsset.Code)) // secondaryAsset in API = base
+	query.Set("side", side)
+	query.Set("resolution", strconv.Itoa(resolution))
+
+	path := fmt.Sprintf("/charts/v2/getLatestBar?%s", query.Encode())
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch latest bar for %s: %w", symbol, err)
+	}
+	var resp []swyftxCandle
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp) == 0 {
+		return nil, fmt.Errorf("no latest bar data returned for %s", symbol)
+	}
+	candle := resp[0]
+	openTime := time.UnixMilli(candle.Time)
+	return &models.Candle{
+		Exchange:  c.GetName(),
+		Symbol:    symbol,
+		Interval:  interval,
+		OpenTime:  openTime,
+		CloseTime: openTime.Add(time.Duration(resolution) * time.Minute),
+		Open:      parseStringFloat(candle.Open),
+		High:      parseStringFloat(candle.High),
+		Low:       parseStringFloat(candle.Low),
+		Close:     parseStringFloat(candle.Close),
+		Volume:    candle.Volume,
+	}, nil
 }
 
 type swyftxCandle struct {
@@ -1488,4 +1511,144 @@ func parseStringFloat(value string) float64 {
 		return 0
 	}
 	return f
+}
+
+// GetUserProfile retrieves the user's profile information.
+// Based on Swyftx OpenAPI spec: GET /user
+func (c *SwyftxClient) GetUserProfile() (*SwyftxUserProfile, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodGet, "/user", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Profile SwyftxUserProfile `json:"profile"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp.Profile, nil
+}
+
+// SwyftxUserProfile represents user profile information from the Swyftx API.
+type SwyftxUserProfile struct {
+	DOB    int64 `json:"dob"`
+	Name   struct {
+		First string `json:"first"`
+		Last  string `json:"last"`
+	} `json:"name"`
+	Email    string `json:"email"`
+	Phone    string `json:"phone"`
+	Currency struct {
+		ID   int    `json:"id"`
+		Code string `json:"code"`
+	} `json:"currency"`
+	UserHash  string                 `json:"user_hash"`
+	Metadata  map[string]interface{} `json:"metadata"`
+	Settings  map[string]interface{} `json:"userSettings"`
+}
+
+// GetUserCurrency retrieves the user's default currency.
+// Based on Swyftx OpenAPI spec: GET /user (returns currency in profile)
+func (c *SwyftxClient) GetUserCurrency() (string, error) {
+	profile, err := c.GetUserProfile()
+	if err != nil {
+		return "", err
+	}
+	return profile.Currency.Code, nil
+}
+
+// GetUserFees retrieves general order fees.
+// Based on Swyftx OpenAPI spec: GET /user/fees
+func (c *SwyftxClient) GetUserFees() (float64, error) {
+	ctx := context.Background()
+	data, err := c.doRequest(ctx, http.MethodGet, "/user/fees", nil, true)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		GeneralOrderFee string `json:"generalOrderFee"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, err
+	}
+	return parseStringFloat(resp.GeneralOrderFee), nil
+}
+
+// GetOrderFee retrieves the order fee for a specific trading pair and direction.
+// Based on Swyftx OpenAPI spec: GET /user/fees/{primary}/{secondary}/{direction}
+// Parameters:
+//   - symbol: Trading pair symbol (e.g., "BTC/AUD")
+//   - direction: "BUY" or "SELL"
+func (c *SwyftxClient) GetOrderFee(symbol, direction string) (float64, error) {
+	ctx := context.Background()
+	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
+	if err != nil {
+		return 0, err
+	}
+	direction = strings.ToUpper(direction)
+	if direction != "BUY" && direction != "SELL" {
+		return 0, fmt.Errorf("direction must be 'BUY' or 'SELL', got: %s", direction)
+	}
+	path := fmt.Sprintf("/user/fees/%d/%d/%s", quoteAsset.ID, baseAsset.ID, direction)
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		OrderFee string `json:"orderFee"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, err
+	}
+	return parseStringFloat(resp.OrderFee), nil
+}
+
+// GetMarketDetail retrieves detailed market information for an asset.
+// Based on Swyftx OpenAPI spec: GET /markets/info/detail/{assetCode}
+func (c *SwyftxClient) GetMarketDetail(assetCode string) (*SwyftxMarketDetail, error) {
+	ctx := context.Background()
+	path := fmt.Sprintf("/markets/info/detail/%s", strings.ToUpper(assetCode))
+	data, err := c.doPublicRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp []SwyftxMarketDetail
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp) == 0 {
+		return nil, fmt.Errorf("no market detail found for %s", assetCode)
+	}
+	return &resp[0], nil
+}
+
+// SwyftxMarketDetail represents detailed market information from the Swyftx API.
+type SwyftxMarketDetail struct {
+	Name        string `json:"name"`
+	ID          int    `json:"id"`
+	Description string `json:"description"`
+	Category    string `json:"category"`
+	Mineable    int    `json:"mineable"`
+	Spread      string `json:"spread"`
+	Rank        int    `json:"rank"`
+	RankSuffix  string `json:"rankSuffix"`
+	Volume      struct {
+		Volume24H  float64 `json:"24H"`
+		Volume1W   float64 `json:"1W"`
+		Volume1M   float64 `json:"1M"`
+		MarketCap  float64 `json:"marketCap"`
+	} `json:"volume"`
+	URLs struct {
+		Website string `json:"website"`
+		Twitter string `json:"twitter"`
+		Reddit  string `json:"reddit"`
+		TechDoc string `json:"techDoc"`
+		Explorer string `json:"explorer"`
+	} `json:"urls"`
+	Supply struct {
+		Circulating float64 `json:"circulating"`
+		Total       float64 `json:"total"`
+		Max         float64 `json:"max"`
+	} `json:"supply"`
 }
