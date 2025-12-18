@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	swyftxHTTPTimeout        = 12 * time.Second
+	swyftxHTTPTimeout        = 30 * time.Second // Increased from 12s to accommodate slower chart endpoints
 	swyftxAssetCacheTTL      = 30 * time.Minute
 	swyftxTokenRefreshLeeway = 45 * time.Second
 	swyftxUserAgent          = "GoExchangeClient/1.0"
@@ -36,6 +36,9 @@ const (
 	// According to Swyftx API docs, access tokens last for a week (7 days).
 	// This fallback is only used if JWT expiry cannot be parsed from the token.
 	swyftxTokenExpiry = 7 * 24 * time.Hour
+	// swyftxTokenRefreshInterval is how often to proactively refresh the access token.
+	// Tokens are refreshed every 5 days to ensure they remain valid.
+	swyftxTokenRefreshInterval = 5 * 24 * time.Hour
 )
 
 // SwyftxClient implements the ExchangeClient interface for the Swyftx exchange.
@@ -50,9 +53,10 @@ type SwyftxClient struct {
 	userAgent     string
 	httpTimeout   time.Duration
 
-	tokenMu     sync.RWMutex
-	accessToken string
-	tokenExpiry time.Time
+	tokenMu          sync.RWMutex
+	accessToken      string
+	tokenExpiry      time.Time
+	tokenRefreshedAt time.Time
 
 	assetMu       sync.RWMutex
 	assets        map[string]*swyftxAsset
@@ -188,7 +192,43 @@ func (c *SwyftxClient) doPublicRequest(ctx context.Context, method, path string,
 	return c.doRequestWithBase(ctx, method, path, body, false, publicBase)
 }
 
+// doChartRequest performs a request for chart endpoints with a longer timeout
+// Chart endpoints can be slower, so we use 30 seconds instead of the default 12 seconds
+func (c *SwyftxClient) doChartRequest(ctx context.Context, method, path string, body interface{}, auth bool) ([]byte, error) {
+	publicBase := c.publicBaseURL
+	if publicBase == "" {
+		publicBase = c.baseURL
+	}
+	var token string
+	if auth {
+		var err error
+		token, err = c.getAccessToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Use longer timeout for chart requests (30 seconds)
+	chartTimeout := 30 * time.Second
+	return c.doRequestWithBaseAndTokenTimeout(ctx, method, path, body, token, publicBase, chartTimeout)
+}
+
 func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path string, body interface{}, auth bool, baseURL string) ([]byte, error) {
+	var token string
+	if auth {
+		var err error
+		token, err = c.getAccessToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return c.doRequestWithBaseAndToken(ctx, method, path, body, token, baseURL)
+}
+
+func (c *SwyftxClient) doRequestWithBaseAndToken(ctx context.Context, method, path string, body interface{}, token string, baseURL string) ([]byte, error) {
+	return c.doRequestWithBaseAndTokenTimeout(ctx, method, path, body, token, baseURL, c.httpTimeout)
+}
+
+func (c *SwyftxClient) doRequestWithBaseAndTokenTimeout(ctx context.Context, method, path string, body interface{}, token string, baseURL string, timeout time.Duration) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -205,12 +245,8 @@ func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path strin
 		"Content-Type": "application/json",
 		"User-Agent":   c.userAgent,
 	}
-	if auth {
+	if token != "" {
 		// JWT token must be included in Authorization header as "Bearer <token>"
-		token, err := c.getAccessToken(ctx)
-		if err != nil {
-			return nil, err
-		}
 		headers["Authorization"] = "Bearer " + token
 	}
 	fullURL := strings.TrimRight(baseURL, "/") + path
@@ -222,13 +258,13 @@ func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path strin
 	var err error
 	switch method {
 	case http.MethodGet:
-		resp, err = c.httpClient.Get(ctx, fullURL, c.httpTimeout, nil, opts...)
+		resp, err = c.httpClient.Get(ctx, fullURL, timeout, nil, opts...)
 	case http.MethodPost:
-		resp, err = c.httpClient.Post(ctx, fullURL, bytes.NewReader(bodyBytes), c.httpTimeout, nil, opts...)
+		resp, err = c.httpClient.Post(ctx, fullURL, bytes.NewReader(bodyBytes), timeout, nil, opts...)
 	case http.MethodPut:
-		resp, err = c.httpClient.Put(ctx, fullURL, bytes.NewReader(bodyBytes), c.httpTimeout, nil, opts...)
+		resp, err = c.httpClient.Put(ctx, fullURL, bytes.NewReader(bodyBytes), timeout, nil, opts...)
 	case http.MethodDelete:
-		resp, err = c.httpClient.Delete(ctx, fullURL, c.httpTimeout, nil, opts...)
+		resp, err = c.httpClient.Delete(ctx, fullURL, timeout, nil, opts...)
 	default:
 		return nil, fmt.Errorf("unsupported method %s", method)
 	}
@@ -249,20 +285,35 @@ func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path strin
 // getAccessToken retrieves a valid JWT access token.
 // According to Swyftx API documentation:
 // - API keys (refresh tokens) are used to generate access tokens via /auth/refresh/
-// - The refresh endpoint does not require authentication
+// - The refresh endpoint requires authentication via Authorization header with Bearer token
 // - Access tokens (JWTs) last for a week before expiring
 // - An API key can be used to generate any number of access tokens
+// Tokens are proactively refreshed every 5 days to ensure they remain valid.
 func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 	c.tokenMu.RLock()
 	token := c.accessToken
 	expires := c.tokenExpiry
+	refreshedAt := c.tokenRefreshedAt
 	c.tokenMu.RUnlock()
-	if token != "" && time.Until(expires) > swyftxTokenRefreshLeeway {
+
+	// Check if token needs refresh: either expired or 5 days have passed since last refresh
+	needsRefresh := token == "" ||
+		time.Until(expires) <= swyftxTokenRefreshLeeway ||
+		(!refreshedAt.IsZero() && time.Since(refreshedAt) >= swyftxTokenRefreshInterval)
+
+	if !needsRefresh {
 		return token, nil
 	}
+
 	c.tokenMu.Lock()
 	defer c.tokenMu.Unlock()
-	if c.accessToken != "" && time.Until(c.tokenExpiry) > swyftxTokenRefreshLeeway {
+
+	// Double-check after acquiring write lock
+	needsRefresh = c.accessToken == "" ||
+		time.Until(c.tokenExpiry) <= swyftxTokenRefreshLeeway ||
+		(!c.tokenRefreshedAt.IsZero() && time.Since(c.tokenRefreshedAt) >= swyftxTokenRefreshInterval)
+
+	if !needsRefresh {
 		return c.accessToken, nil
 	}
 	if c.APIKey() == "" {
@@ -271,16 +322,21 @@ func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 	// Refresh Access Token endpoint: POST /auth/refresh/
 	// Request body: {"apiKey": "<api_key>"}
 	// Response: {"accessToken": "<jwt_token>"}
-	// This endpoint does not require authentication
+	// This endpoint requires authentication via Authorization header with Bearer token
 	body := map[string]string{"apiKey": c.APIKey()}
 	authBase := c.authBaseURL
 	if authBase == "" {
 		authBase = c.baseURL
 	}
-	data, err := c.doRequestWithBase(ctx, http.MethodPost, "/auth/refresh/", body, false, authBase)
+	// Use existing token if available (even if expired) for refresh request
+	var existingToken string
+	if c.accessToken != "" {
+		existingToken = c.accessToken
+	}
+	data, err := c.doRequestWithBaseAndToken(ctx, http.MethodPost, "/auth/refresh/", body, existingToken, authBase)
 	if err != nil && c.publicBaseURL != "" && !strings.EqualFold(authBase, c.publicBaseURL) {
 		if httpErr, ok := err.(*common.ExchangeError); ok && httpErr.StatusCode == http.StatusNotFound {
-			data, err = c.doRequestWithBase(ctx, http.MethodPost, "/auth/refresh/", body, false, c.publicBaseURL)
+			data, err = c.doRequestWithBaseAndToken(ctx, http.MethodPost, "/auth/refresh/", body, existingToken, c.publicBaseURL)
 		}
 	}
 	if err != nil {
@@ -298,6 +354,7 @@ func (c *SwyftxClient) getAccessToken(ctx context.Context) (string, error) {
 	// Parse JWT expiry from token. Access tokens last for a week per API docs.
 	expiresAt := parseJWTExpiry(resp.AccessToken)
 	c.accessToken = resp.AccessToken
+	c.tokenRefreshedAt = time.Now()
 	if expiresAt.IsZero() {
 		// Fallback: use default token expiry if JWT parsing fails
 		c.tokenExpiry = time.Now().Add(swyftxTokenExpiry)
@@ -357,11 +414,13 @@ func (c *SwyftxClient) ensureAssets(ctx context.Context) error {
 		c.assetsByID[asset.ID] = &assets[i]
 	}
 	c.assetsFetched = time.Now()
-	c.assetPairs = c.buildTradingPairsLocked()
+	// Don't build trading pairs here - build them lazily when GetTradingPairs() is called
+	// This avoids expensive HTTP calls during asset initialization
+	c.assetPairs = nil
 	return nil
 }
 
-func (c *SwyftxClient) buildTradingPairsLocked() []common.TradingPair {
+func (c *SwyftxClient) buildTradingPairsLocked(ctx context.Context) []common.TradingPair {
 	if len(c.assets) == 0 {
 		return nil
 	}
@@ -380,9 +439,20 @@ func (c *SwyftxClient) buildTradingPairsLocked() []common.TradingPair {
 	// Filter secondary assets (bases): secondary = 1, deposit_enabled = 1, withdraw_enabled = 1,
 	// no delisting, and not disabled. Also verify tradability with the API.
 	var pairs []common.TradingPair
-	ctx := context.Background()
 	for _, quote := range quotes {
+		// Check context cancellation before processing each quote
+		select {
+		case <-ctx.Done():
+			return pairs // Return partial results if context is cancelled
+		default:
+		}
 		for _, base := range c.assets {
+			// Check context cancellation before processing each base
+			select {
+			case <-ctx.Done():
+				return pairs // Return partial results if context is cancelled
+			default:
+			}
 			if !bool(base.Secondary) || base.ID == quote.ID {
 				continue
 			}
@@ -432,13 +502,19 @@ func (c *SwyftxClient) resolveSymbol(ctx context.Context, symbol string) (*swyft
 
 // GetTradingPairs returns supported trading pairs.
 func (c *SwyftxClient) GetTradingPairs() ([]common.TradingPair, error) {
-	if err := c.ensureAssets(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := c.ensureAssets(ctx); err != nil {
 		return nil, err
 	}
-	c.assetMu.RLock()
-	defer c.assetMu.RUnlock()
+	c.assetMu.Lock()
+	// Build trading pairs lazily if not already built
+	if c.assetPairs == nil {
+		c.assetPairs = c.buildTradingPairsLocked(ctx)
+	}
 	pairs := make([]common.TradingPair, len(c.assetPairs))
 	copy(pairs, c.assetPairs)
+	c.assetMu.Unlock()
 	return pairs, nil
 }
 
@@ -698,7 +774,8 @@ func calculateVolatility(candles []models.Candle) float64 {
 
 // GetTicker returns ticker data for a symbol.
 func (c *SwyftxClient) GetTicker(symbol string) (*models.Ticker, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -715,7 +792,18 @@ func (c *SwyftxClient) GetTicker(symbol string) (*models.Ticker, error) {
 	sellPrice := parseStringFloat(info.Sell)
 	lastPrice := parseStringFloat(rate.Price)
 	if lastPrice == 0 {
-		lastPrice = (buyPrice + sellPrice) / 2
+		// Fallback to mid-price if rate.Price is not available
+		if buyPrice > 0 && sellPrice > 0 {
+			lastPrice = (buyPrice + sellPrice) / 2
+		} else if buyPrice > 0 {
+			lastPrice = buyPrice
+		} else if sellPrice > 0 {
+			lastPrice = sellPrice
+		}
+	}
+	// Validate that we have a valid last price
+	if lastPrice <= 0 {
+		return nil, fmt.Errorf("swyftx: unable to determine last price for %s (rate.Price=%s, buy=%s, sell=%s)", symbol, rate.Price, info.Buy, info.Sell)
 	}
 	return &models.Ticker{
 		Exchange:  c.GetName(),
@@ -986,7 +1074,8 @@ func convertOrderBookEntries(entries []swyftxOrderBookEntry) []models.OrderBookE
 //   - timeEnd: End time (milliseconds, required)
 //   - limit: Number of candles (max 10000, optional)
 func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limit int) ([]models.Candle, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -1008,31 +1097,102 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 		// Default to 24 hours ago if not specified
 		timeStart = time.Now().Add(-24 * time.Hour)
 	}
-	timeEnd := time.Now()
+	// Calculate timeEnd based on timeStart + (limit * resolution minutes)
+	// This ensures the time range matches the requested number of candles
+	calculatedEnd := timeStart.Add(time.Duration(limit) * time.Duration(resolution) * time.Minute)
+
+	// Round down current time to the start of the current resolution period
+	// Then go back one period to ensure we don't request incomplete candles
+	now := time.Now()
+	resolutionDuration := time.Duration(resolution) * time.Minute
+	currentPeriodStart := now.Truncate(resolutionDuration)
+	// Latest complete period end is one period before current period start
+	latestCompleteEnd := currentPeriodStart
+
+	// Use the earlier of calculatedEnd or latestCompleteEnd
+	// This ensures we don't request incomplete candles
+	var timeEnd time.Time
+	if calculatedEnd.Before(latestCompleteEnd) || calculatedEnd.Equal(latestCompleteEnd) {
+		timeEnd = calculatedEnd
+	} else {
+		timeEnd = latestCompleteEnd
+	}
+
+	// Ensure timeEnd is always strictly after timeStart (at least one resolution period)
+	if !timeEnd.After(timeStart) {
+		timeEnd = timeStart.Add(resolutionDuration)
+	}
 
 	// Build query parameters according to OpenAPI spec
+	// Resolution should be string format: "1m", "5m", "1h", "4h", "1d"
 	query := url.Values{}
-	query.Set("resolution", strconv.Itoa(resolution))
+	// Normalize interval to lowercase for API (e.g., "1m", "5m", "1h", "4h", "1d")
+	resolutionStr := strings.ToLower(interval)
+	if resolutionStr == "" {
+		resolutionStr = "1m" // Default to 1 minute
+	}
+	query.Set("resolution", resolutionStr)
 	query.Set("timeStart", strconv.FormatInt(timeStart.Unix()*1000, 10))
 	query.Set("timeEnd", strconv.FormatInt(timeEnd.Unix()*1000, 10))
-	query.Set("limit", strconv.Itoa(limit))
+	// Limit is optional - API will return candles in the time range if limit is not specified
+	// Only include limit if explicitly requested and within API limits
+	if limit > 0 && limit <= 10000 {
+		// Note: Some API implementations may prefer time range over limit, so we include it but API may ignore it
+		query.Set("limit", strconv.Itoa(limit))
+	}
 
-	// Use the OpenAPI v2 endpoint: /charts/v2/getBars/{baseAsset}/{secondaryAsset}/{side}
-	// Note: baseAsset in path is actually the quote (primary), secondaryAsset is the base
-	// This matches the OpenAPI spec where baseAsset is the quote currency
-	path := fmt.Sprintf("/charts/v2/getBars/%s/%s/bid?%s",
-		strings.ToUpper(quoteAsset.Code), // baseAsset in API = quote
-		strings.ToUpper(baseAsset.Code),  // secondaryAsset in API = base
+	// Use the OpenAPI v2 endpoint: /charts/v2/getBars/{baseAsset}/{secondaryAsset}/{side}/
+	// According to OpenAPI spec: baseAsset is the quote currency (e.g., AUD), secondaryAsset is the base currency (e.g., TRX)
+	// This matches GetLatestBar and ResolveSymbol implementations
+	// Note: URL format requires trailing slash after {side}
+	path := fmt.Sprintf("/charts/v2/getBars/%s/%s/bid/?%s",
+		strings.ToUpper(quoteAsset.Code), // baseAsset = quote currency (e.g., AUD)
+		strings.ToUpper(baseAsset.Code),  // secondaryAsset = base currency (e.g., TRX)
 		query.Encode())
 
-	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	// Use chart request method with longer timeout
+	// Chart endpoints require authentication per OpenAPI spec
+	chartTimeout := 30 * time.Second
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	data, err := c.doRequestWithBaseAndTokenTimeout(ctx, http.MethodGet, path, nil, token, c.baseURL, chartTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch candles for %s: %w", symbol, err)
 	}
-	var resp []swyftxCandle
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, err
+
+	// Check if response is an error object first
+	var errorResp struct {
+		Error struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
+	if err := json.Unmarshal(data, &errorResp); err == nil && errorResp.Error.Error != "" {
+		return nil, fmt.Errorf("failed to fetch candles for %s: [validation:invalid_request] %s", symbol, string(data))
+	}
+
+	// API returns candles wrapped in an object: {"candles": [...]}
+	var respWrapper struct {
+		Candles []swyftxCandle `json:"candles"`
+	}
+	if err := json.Unmarshal(data, &respWrapper); err != nil {
+		// Fallback: try to unmarshal as direct array (for backward compatibility)
+		var resp []swyftxCandle
+		if err2 := json.Unmarshal(data, &resp); err2 == nil {
+			respWrapper.Candles = resp
+		} else {
+			// If unmarshaling fails, check if it's an empty object or different format
+			var emptyObj map[string]interface{}
+			if json.Unmarshal(data, &emptyObj) == nil && len(emptyObj) == 0 {
+				// Empty response, return empty candles
+				return []models.Candle{}, nil
+			}
+			return nil, fmt.Errorf("failed to parse candles response for %s: %w (response: %s)", symbol, err, string(data))
+		}
+	}
+	resp := respWrapper.Candles
 	candles := make([]models.Candle, 0, len(resp))
 	for _, candle := range resp {
 		openTime := time.UnixMilli(candle.Time)
@@ -1042,10 +1202,10 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 			Interval:  interval,
 			OpenTime:  openTime,
 			CloseTime: openTime.Add(time.Duration(resolution) * time.Minute),
-			Open:      parseStringFloat(candle.Open),
-			High:      parseStringFloat(candle.High),
-			Low:       parseStringFloat(candle.Low),
-			Close:     parseStringFloat(candle.Close),
+			Open:      float64(candle.Open),
+			High:      float64(candle.High),
+			Low:       float64(candle.Low),
+			Close:     float64(candle.Close),
 			Volume:    candle.Volume,
 		})
 	}
@@ -1077,15 +1237,31 @@ func (c *SwyftxClient) GetLatestBar(symbol, interval, side string) (*models.Cand
 
 	// Build query parameters according to OpenAPI spec
 	query := url.Values{}
-	query.Set("baseAsset", strings.ToUpper(quoteAsset.Code)) // baseAsset in API = quote
+	query.Set("baseAsset", strings.ToUpper(quoteAsset.Code))     // baseAsset in API = quote
 	query.Set("secondaryAsset", strings.ToUpper(baseAsset.Code)) // secondaryAsset in API = base
 	query.Set("side", side)
 	query.Set("resolution", strconv.Itoa(resolution))
 
 	path := fmt.Sprintf("/charts/v2/getLatestBar?%s", query.Encode())
-	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
+	// Use chart request method with longer timeout
+	// Try public request first (chart data is typically public market data)
+	// Fall back to authenticated request if public fails
+	publicBase := c.publicBaseURL
+	if publicBase == "" {
+		publicBase = c.baseURL
+	}
+	chartTimeout := 30 * time.Second
+	data, err := c.doRequestWithBaseAndTokenTimeout(ctx, http.MethodGet, path, nil, "", publicBase, chartTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch latest bar for %s: %w", symbol, err)
+		// Fallback to authenticated request if public request fails
+		var token string
+		token, err = c.getAccessToken(ctx)
+		if err == nil {
+			data, err = c.doRequestWithBaseAndTokenTimeout(ctx, http.MethodGet, path, nil, token, c.baseURL, chartTimeout)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch latest bar for %s: %w", symbol, err)
+		}
 	}
 	var resp []swyftxCandle
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -1102,21 +1278,48 @@ func (c *SwyftxClient) GetLatestBar(symbol, interval, side string) (*models.Cand
 		Interval:  interval,
 		OpenTime:  openTime,
 		CloseTime: openTime.Add(time.Duration(resolution) * time.Minute),
-		Open:      parseStringFloat(candle.Open),
-		High:      parseStringFloat(candle.High),
-		Low:       parseStringFloat(candle.Low),
-		Close:     parseStringFloat(candle.Close),
+		Open:      float64(candle.Open),
+		High:      float64(candle.High),
+		Low:       float64(candle.Low),
+		Close:     float64(candle.Close),
 		Volume:    candle.Volume,
 	}, nil
 }
 
+// flexibleFloat can unmarshal from both string and number
+type flexibleFloat float64
+
+func (f *flexibleFloat) UnmarshalJSON(data []byte) error {
+	// Try to unmarshal as number first
+	var num float64
+	if err := json.Unmarshal(data, &num); err == nil {
+		*f = flexibleFloat(num)
+		return nil
+	}
+	// Try to unmarshal as string
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return err
+	}
+	parsed, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		return err
+	}
+	*f = flexibleFloat(parsed)
+	return nil
+}
+
+func (f flexibleFloat) String() string {
+	return strconv.FormatFloat(float64(f), 'f', -1, 64)
+}
+
 type swyftxCandle struct {
-	Time   int64   `json:"time"`
-	Open   string  `json:"open"`
-	High   string  `json:"high"`
-	Low    string  `json:"low"`
-	Close  string  `json:"close"`
-	Volume float64 `json:"volume"`
+	Time   int64         `json:"time"`
+	Open   flexibleFloat `json:"open"`
+	High   flexibleFloat `json:"high"`
+	Low    flexibleFloat `json:"low"`
+	Close  flexibleFloat `json:"close"`
+	Volume float64       `json:"volume"`
 }
 
 func swyftxResolution(interval string) (int, error) {
@@ -1532,8 +1735,8 @@ func (c *SwyftxClient) GetUserProfile() (*SwyftxUserProfile, error) {
 
 // SwyftxUserProfile represents user profile information from the Swyftx API.
 type SwyftxUserProfile struct {
-	DOB    int64 `json:"dob"`
-	Name   struct {
+	DOB  int64 `json:"dob"`
+	Name struct {
 		First string `json:"first"`
 		Last  string `json:"last"`
 	} `json:"name"`
@@ -1543,9 +1746,9 @@ type SwyftxUserProfile struct {
 		ID   int    `json:"id"`
 		Code string `json:"code"`
 	} `json:"currency"`
-	UserHash  string                 `json:"user_hash"`
-	Metadata  map[string]interface{} `json:"metadata"`
-	Settings  map[string]interface{} `json:"userSettings"`
+	UserHash string                 `json:"user_hash"`
+	Metadata map[string]interface{} `json:"metadata"`
+	Settings map[string]interface{} `json:"userSettings"`
 }
 
 // GetUserCurrency retrieves the user's default currency.
@@ -1634,16 +1837,16 @@ type SwyftxMarketDetail struct {
 	Rank        int    `json:"rank"`
 	RankSuffix  string `json:"rankSuffix"`
 	Volume      struct {
-		Volume24H  float64 `json:"24H"`
-		Volume1W   float64 `json:"1W"`
-		Volume1M   float64 `json:"1M"`
-		MarketCap  float64 `json:"marketCap"`
+		Volume24H float64 `json:"24H"`
+		Volume1W  float64 `json:"1W"`
+		Volume1M  float64 `json:"1M"`
+		MarketCap float64 `json:"marketCap"`
 	} `json:"volume"`
 	URLs struct {
-		Website string `json:"website"`
-		Twitter string `json:"twitter"`
-		Reddit  string `json:"reddit"`
-		TechDoc string `json:"techDoc"`
+		Website  string `json:"website"`
+		Twitter  string `json:"twitter"`
+		Reddit   string `json:"reddit"`
+		TechDoc  string `json:"techDoc"`
 		Explorer string `json:"explorer"`
 	} `json:"urls"`
 	Supply struct {
@@ -1793,10 +1996,10 @@ func (c *SwyftxClient) GetWithdrawalLimits() (*SwyftxWithdrawalLimits, error) {
 
 // SwyftxWithdrawalLimits represents withdrawal limits from the Swyftx API.
 type SwyftxWithdrawalLimits struct {
-	Used          float64 `json:"used"`
-	Remaining     float64 `json:"remaining"`
-	Limit         float64 `json:"limit"`
-	RollingCycleHrs int   `json:"rollingCycleHrs"`
+	Used            float64 `json:"used"`
+	Remaining       float64 `json:"remaining"`
+	Limit           float64 `json:"limit"`
+	RollingCycleHrs int     `json:"rollingCycleHrs"`
 }
 
 // ============================================================================
@@ -1929,10 +2132,10 @@ func (c *SwyftxClient) GetSwapRate(buy, sell, amount, limit string, intermediary
 func (c *SwyftxClient) ExecuteSwap(buy, sell string, limitAsset int, limitQty string, intermediateAssetID string) (map[string]interface{}, error) {
 	ctx := context.Background()
 	body := map[string]interface{}{
-		"buy":       buy,
-		"sell":      sell,
+		"buy":        buy,
+		"sell":       sell,
 		"limitAsset": limitAsset,
-		"limitQty":  limitQty,
+		"limitQty":   limitQty,
 	}
 	if intermediateAssetID != "" {
 		body["intermediateAssetId"] = intermediateAssetID
@@ -2073,8 +2276,8 @@ func (c *SwyftxClient) GetUserAffiliations(forceRefresh bool) (*SwyftxUserAffili
 
 // SwyftxUserAffiliations represents user affiliations from the Swyftx API.
 type SwyftxUserAffiliations struct {
-	ReferralLink      string  `json:"referral_link"`
-	ReferredUsers     int     `json:"referred_users"`
+	ReferralLink       string  `json:"referral_link"`
+	ReferredUsers      int     `json:"referred_users"`
 	OutstandingBalance float64 `json:"outstandingBalance"`
 }
 
@@ -2233,6 +2436,7 @@ func (c *SwyftxClient) Logout() error {
 	c.tokenMu.Lock()
 	c.accessToken = ""
 	c.tokenExpiry = time.Time{}
+	c.tokenRefreshedAt = time.Time{}
 	c.tokenMu.Unlock()
 	return nil
 }

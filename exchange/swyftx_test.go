@@ -12,7 +12,7 @@ func TestSwyftxGetTicker_TRX_AUD(t *testing.T) {
 		t.Skip("skipping live Swyftx call in short mode")
 	}
 
-	client := NewSwyftxClient("", "", true, nil)
+	client := NewSwyftxClient("", "", false, nil)
 
 	ticker, err := client.GetTicker("TRX/AUD")
 	if err != nil {
@@ -31,7 +31,7 @@ func TestSwyftxFetchMarketData_TRX_AUD(t *testing.T) {
 		t.Skip("skipping live Swyftx call in short mode")
 	}
 
-	client := NewSwyftxClient("", "", true, nil)
+	client := NewSwyftxClient("", "", false, nil)
 
 	md, err := client.FetchMarketData("TRX/AUD")
 	if err != nil {
@@ -50,7 +50,7 @@ func TestSwyftxGetCandles_TRX_AUD(t *testing.T) {
 		t.Skip("skipping live Swyftx call in short mode")
 	}
 
-	client := NewSwyftxClient("", "", true, nil)
+	client := NewSwyftxClient("", "", false, nil)
 
 	// Fetch 1 hour of 1-minute candles
 	// The fully built URL would look like:
@@ -107,7 +107,7 @@ func TestSwyftxFindScalpingCoins(t *testing.T) {
 	t.Log("Starting scalping coins analysis (this may take a few minutes)...")
 	fmt.Println("Starting scalping coins analysis (this may take a few minutes)...")
 
-	client := NewSwyftxClient("", "", true, nil)
+	client := NewSwyftxClient("", "", false, nil)
 
 	// First, let's check if we can get trading pairs to see if assets are loading
 	pairs, err := client.GetTradingPairs()
