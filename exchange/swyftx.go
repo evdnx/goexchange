@@ -1500,7 +1500,9 @@ func (c *SwyftxClient) CreateOrder(symbol string, side common.OrderSide, orderTy
 		"assetQuantity": strings.ToUpper(assetQuantity),
 		"orderType":     orderTypeID, // Send as integer, not string
 	}
-	if price > 0 {
+	// Only include trigger for LIMIT (3, 4) and STOP_LIMIT (5, 6) orders
+	// MARKET orders (1, 2) should not include trigger
+	if price > 0 && (orderTypeID == 3 || orderTypeID == 4 || orderTypeID == 5 || orderTypeID == 6) {
 		body["trigger"] = strconv.FormatFloat(price, 'f', baseAsset.PriceScale, 64)
 	}
 	data, err := c.doRequest(ctx, http.MethodPost, "/orders/", body, true)
