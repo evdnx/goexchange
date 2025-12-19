@@ -2,9 +2,26 @@ package exchange
 
 import (
 	"fmt"
+	"os"
 	"testing"
 	"time"
+
+	"github.com/joho/godotenv"
 )
+
+// TestMain loads environment variables from .env file before running tests
+func TestMain(m *testing.M) {
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		// If .env file doesn't exist, that's okay - we'll use environment variables
+		// that may already be set in the environment
+		fmt.Println("Warning: .env file not found, using environment variables if set")
+	}
+
+	// Run tests
+	code := m.Run()
+	os.Exit(code)
+}
 
 // Integration-style check that public market data endpoints respond.
 func TestSwyftxGetTicker_TRX_AUD(t *testing.T) {
@@ -12,7 +29,9 @@ func TestSwyftxGetTicker_TRX_AUD(t *testing.T) {
 		t.Skip("skipping live Swyftx call in short mode")
 	}
 
-	client := NewSwyftxClient("", "", false, nil)
+	apiKey := os.Getenv("SWYFTX_API_KEY")
+	apiSecret := os.Getenv("SWYFTX_API_SECRET")
+	client := NewSwyftxClient(apiKey, apiSecret, false, nil)
 
 	ticker, err := client.GetTicker("TRX/AUD")
 	if err != nil {
@@ -31,7 +50,9 @@ func TestSwyftxFetchMarketData_TRX_AUD(t *testing.T) {
 		t.Skip("skipping live Swyftx call in short mode")
 	}
 
-	client := NewSwyftxClient("", "", false, nil)
+	apiKey := os.Getenv("SWYFTX_API_KEY")
+	apiSecret := os.Getenv("SWYFTX_API_SECRET")
+	client := NewSwyftxClient(apiKey, apiSecret, false, nil)
 
 	md, err := client.FetchMarketData("TRX/AUD")
 	if err != nil {
@@ -50,7 +71,9 @@ func TestSwyftxGetCandles_TRX_AUD(t *testing.T) {
 		t.Skip("skipping live Swyftx call in short mode")
 	}
 
-	client := NewSwyftxClient("", "", false, nil)
+	apiKey := os.Getenv("SWYFTX_API_KEY")
+	apiSecret := os.Getenv("SWYFTX_API_SECRET")
+	client := NewSwyftxClient(apiKey, apiSecret, false, nil)
 
 	// Fetch 1 hour of 1-minute candles
 	// The fully built URL would look like:
@@ -107,7 +130,9 @@ func TestSwyftxFindScalpingCoins(t *testing.T) {
 	t.Log("Starting scalping coins analysis (this may take a few minutes)...")
 	fmt.Println("Starting scalping coins analysis (this may take a few minutes)...")
 
-	client := NewSwyftxClient("", "", false, nil)
+	apiKey := os.Getenv("SWYFTX_API_KEY")
+	apiSecret := os.Getenv("SWYFTX_API_SECRET")
+	client := NewSwyftxClient(apiKey, apiSecret, false, nil)
 
 	// First, let's check if we can get trading pairs to see if assets are loading
 	pairs, err := client.GetTradingPairs()
