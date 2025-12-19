@@ -3,6 +3,8 @@ package exchange
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -11,11 +13,33 @@ import (
 
 // TestMain loads environment variables from .env file before running tests
 func TestMain(m *testing.M) {
-	// Load .env file
-	if err := godotenv.Load(); err != nil {
+	// Find repository root by looking for go.mod file
+	// Get the directory of this test file
+	_, testFile, _, _ := runtime.Caller(0)
+	testDir := filepath.Dir(testFile)
+
+	// Walk up to find go.mod (repository root)
+	repoRoot := testDir
+	for {
+		goModPath := filepath.Join(repoRoot, "go.mod")
+		if _, err := os.Stat(goModPath); err == nil {
+			break
+		}
+		parent := filepath.Dir(repoRoot)
+		if parent == repoRoot {
+			// Reached filesystem root, fallback to current directory
+			repoRoot = "."
+			break
+		}
+		repoRoot = parent
+	}
+
+	// Load .env file from repository root
+	envPath := filepath.Join(repoRoot, ".env")
+	if err := godotenv.Load(envPath); err != nil {
 		// If .env file doesn't exist, that's okay - we'll use environment variables
 		// that may already be set in the environment
-		fmt.Println("Warning: .env file not found, using environment variables if set")
+		fmt.Printf("Warning: .env file not found at %s, using environment variables if set\n", envPath)
 	}
 
 	// Run tests
