@@ -1492,12 +1492,13 @@ func (c *SwyftxClient) CreateOrder(symbol string, side common.OrderSide, orderTy
 	if side == common.OrderSideBuy {
 		assetQuantity = quoteAsset.Code
 	}
-	body := map[string]string{
+	// orderType must be an integer, not a string, per Swyftx API specification
+	body := map[string]interface{}{
 		"primary":       strings.ToUpper(quoteAsset.Code),
 		"secondary":     strings.ToUpper(baseAsset.Code),
 		"quantity":      strconv.FormatFloat(quantity, 'f', -1, 64),
 		"assetQuantity": strings.ToUpper(assetQuantity),
-		"orderType":     strconv.Itoa(orderTypeID),
+		"orderType":     orderTypeID, // Send as integer, not string
 	}
 	if price > 0 {
 		body["trigger"] = strconv.FormatFloat(price, 'f', baseAsset.PriceScale, 64)
