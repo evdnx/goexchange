@@ -1313,6 +1313,30 @@ func (f flexibleFloat) String() string {
 	return strconv.FormatFloat(float64(f), 'f', -1, 64)
 }
 
+// flexibleString can unmarshal from both string and number
+type flexibleString string
+
+func (s *flexibleString) UnmarshalJSON(data []byte) error {
+	// Try to unmarshal as string first
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		*s = flexibleString(str)
+		return nil
+	}
+	// Try to unmarshal as number
+	var num float64
+	if err := json.Unmarshal(data, &num); err == nil {
+		*s = flexibleString(strconv.FormatFloat(num, 'f', -1, 64))
+		return nil
+	}
+	// If both fail, return error
+	return fmt.Errorf("cannot unmarshal %s into flexibleString", string(data))
+}
+
+func (s flexibleString) String() string {
+	return string(s)
+}
+
 type swyftxCandle struct {
 	Time   int64         `json:"time"`
 	Open   flexibleFloat `json:"open"`
@@ -1539,29 +1563,29 @@ type swyftxOrderEnvelope struct {
 }
 
 type swyftxOrderBody struct {
-	OrderUUID      string `json:"orderUuid"`
-	OrderType      int    `json:"order_type"`
-	PrimaryAsset   int    `json:"primary_asset"`
-	SecondaryAsset int    `json:"secondary_asset"`
-	QuantityAsset  int    `json:"quantity_asset"`
-	Quantity       string `json:"quantity"`
-	Trigger        string `json:"trigger"`
-	Status         int    `json:"status"`
-	Created        int64  `json:"created_time"`
-	Updated        int64  `json:"updated_time"`
-	Amount         string `json:"amount"`
-	Total          string `json:"total"`
-	Rate           string `json:"rate"`
-	FeeAmount      string `json:"feeAmount"`
-	FeeAsset       string `json:"feeAsset"`
+	OrderUUID      string         `json:"orderUuid"`
+	OrderType      int            `json:"order_type"`
+	PrimaryAsset   int            `json:"primary_asset"`
+	SecondaryAsset int            `json:"secondary_asset"`
+	QuantityAsset  int            `json:"quantity_asset"`
+	Quantity       flexibleString `json:"quantity"`
+	Trigger        flexibleString `json:"trigger"`
+	Status         int            `json:"status"`
+	Created        int64          `json:"created_time"`
+	Updated        int64          `json:"updated_time"`
+	Amount         flexibleString `json:"amount"`
+	Total          flexibleString `json:"total"`
+	Rate           flexibleString `json:"rate"`
+	FeeAmount      flexibleString `json:"feeAmount"`
+	FeeAsset       string         `json:"feeAsset"`
 }
 
 func convertSwyftxOrder(symbol string, body *swyftxOrderBody) (*common.Order, error) {
 	if body == nil {
 		return nil, errors.New("swyftx: empty order body")
 	}
-	price := parseStringFloat(body.Rate)
-	amount := parseStringFloat(body.Quantity)
+	price := parseStringFloat(body.Rate.String())
+	amount := parseStringFloat(body.Quantity.String())
 	status := mapSwyftxOrderStatus(body.Status)
 	return &common.Order{
 		ID:              body.OrderUUID,
@@ -1571,9 +1595,9 @@ func convertSwyftxOrder(symbol string, body *swyftxOrderBody) (*common.Order, er
 		Status:          status,
 		Price:           price,
 		Amount:          amount,
-		FilledAmount:    parseStringFloat(body.Amount),
-		RemainingAmount: amount - parseStringFloat(body.Amount),
-		Fee:             parseStringFloat(body.FeeAmount),
+		FilledAmount:    parseStringFloat(body.Amount.String()),
+		RemainingAmount: amount - parseStringFloat(body.Amount.String()),
+		Fee:             parseStringFloat(body.FeeAmount.String()),
 		FeeCurrency:     body.FeeAsset,
 		CreatedAt:       time.UnixMilli(body.Created),
 		UpdatedAt:       time.UnixMilli(body.Updated),
