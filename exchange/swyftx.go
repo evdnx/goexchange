@@ -1588,7 +1588,7 @@ type swyftxOrderBody struct {
 	Total          flexibleString `json:"total"`
 	Rate           flexibleString `json:"rate"`
 	FeeAmount      flexibleString `json:"feeAmount"`
-	FeeAsset       string         `json:"feeAsset"`
+	FeeAsset       flexibleString `json:"feeAsset"`
 }
 
 func convertSwyftxOrder(symbol string, body *swyftxOrderBody) (*common.Order, error) {
@@ -1609,7 +1609,7 @@ func convertSwyftxOrder(symbol string, body *swyftxOrderBody) (*common.Order, er
 		FilledAmount:    parseStringFloat(body.Amount.String()),
 		RemainingAmount: amount - parseStringFloat(body.Amount.String()),
 		Fee:             parseStringFloat(body.FeeAmount.String()),
-		FeeCurrency:     body.FeeAsset,
+		FeeCurrency:     body.FeeAsset.String(),
 		CreatedAt:       time.UnixMilli(body.Created),
 		UpdatedAt:       time.UnixMilli(body.Updated),
 		Quantity:        amount,
