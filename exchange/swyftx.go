@@ -192,26 +192,6 @@ func (c *SwyftxClient) doPublicRequest(ctx context.Context, method, path string,
 	return c.doRequestWithBase(ctx, method, path, body, false, publicBase)
 }
 
-// doChartRequest performs a request for chart endpoints with a longer timeout
-// Chart endpoints can be slower, so we use 30 seconds instead of the default 12 seconds
-func (c *SwyftxClient) doChartRequest(ctx context.Context, method, path string, body interface{}, auth bool) ([]byte, error) {
-	publicBase := c.publicBaseURL
-	if publicBase == "" {
-		publicBase = c.baseURL
-	}
-	var token string
-	if auth {
-		var err error
-		token, err = c.getAccessToken(ctx)
-		if err != nil {
-			return nil, err
-		}
-	}
-	// Use longer timeout for chart requests (30 seconds)
-	chartTimeout := 30 * time.Second
-	return c.doRequestWithBaseAndTokenTimeout(ctx, method, path, body, token, publicBase, chartTimeout)
-}
-
 func (c *SwyftxClient) doRequestWithBase(ctx context.Context, method, path string, body interface{}, auth bool, baseURL string) ([]byte, error) {
 	var token string
 	if auth {
