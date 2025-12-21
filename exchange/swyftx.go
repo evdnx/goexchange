@@ -1543,6 +1543,10 @@ func (c *SwyftxClient) CreateOrder(symbol string, side common.OrderSide, orderTy
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, err
 	}
+	// Use envelope's orderUuid if order object doesn't have one
+	if resp.Order.OrderUUID == "" && resp.OrderUUID != "" {
+		resp.Order.OrderUUID = resp.OrderUUID
+	}
 	return convertSwyftxOrder(symbol, &resp.Order)
 }
 
@@ -1566,6 +1570,7 @@ func mapSwyftxOrderType(side common.OrderSide, orderType common.OrderType) (int,
 type swyftxOrderEnvelope struct {
 	OrderUUID string          `json:"orderUuid"`
 	Order     swyftxOrderBody `json:"order"`
+	Processed bool            `json:"processed"`
 }
 
 type swyftxOrderBody struct {
