@@ -257,9 +257,35 @@ func (c *SwyftxClient) doRequestWithBaseAndTokenTimeout(ctx context.Context, met
 		return nil, readErr
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, common.NewExchangeHTTPError(resp.StatusCode, data, string(data))
+		// Parse Swyftx error response format: {"error":{"error":"OrderError","message":"Unable to retrieve user orders"}}
+		errorMsg := parseSwyftxErrorMessage(data)
+		return nil, common.NewExchangeHTTPError(resp.StatusCode, data, errorMsg)
 	}
 	return data, nil
+}
+
+// parseSwyftxErrorMessage extracts the error message from Swyftx error responses.
+// Swyftx returns errors in the format: {"error":{"error":"OrderError","message":"Unable to retrieve user orders"}}
+func parseSwyftxErrorMessage(data []byte) string {
+	if len(data) == 0 {
+		return "unknown error"
+	}
+	var errorResp struct {
+		Error struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &errorResp); err == nil {
+		if errorResp.Error.Message != "" {
+			return errorResp.Error.Message
+		}
+		if errorResp.Error.Error != "" {
+			return errorResp.Error.Error
+		}
+	}
+	// Fallback to raw string if parsing fails
+	return string(data)
 }
 
 // getAccessToken retrieves a valid JWT access token.
@@ -1640,6 +1666,16 @@ func (c *SwyftxClient) GetOrder(symbol, orderID string) (*common.Order, error) {
 		return nil, err
 	}
 	return convertSwyftxOrder(symbol, &body)
+}
+
+// GetOrderStatus retrieves the status of an order by ID.
+// This is more efficient than GetOrders for checking a single order status.
+func (c *SwyftxClient) GetOrderStatus(symbol, orderID string) (common.OrderStatus, error) {
+	order, err := c.GetOrder(symbol, orderID)
+	if err != nil {
+		return "", err
+	}
+	return order.Status, nil
 }
 
 // GetOrders returns orders for a symbol.
