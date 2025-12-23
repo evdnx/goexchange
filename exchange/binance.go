@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -918,6 +920,297 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 	}
 
 	return tradingPairs, nil
+}
+
+// FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
+// It filters coins by minimum volume, calculates volatility from 24h of 1-minute candles,
+// checks bid-ask spread (critical for scalping profitability), and ranks them by a score
+// combining volume, volatility, and spread.
+//
+// Parameters:
+//   - quoteAsset: The quote currency to use (default: "USDT"). Must be a valid quote asset on Binance.
+//   - minVolume: Minimum 24h volume threshold in quote currency (default: 1000000)
+//   - topN: Number of top coins to return (default: 10)
+//   - rateLimitDelay: Delay between API calls to respect rate limits (default: 100ms)
+//   - maxSpread: Maximum allowed bid-ask spread percentage (default: 0.5). Coins with wider spreads are filtered out.
+//
+// Returns a sorted list of ScalpingCoin structs, ranked by score (volume * volatility / spread_factor).
+// Lower spreads are preferred for scalping as they reduce trading costs.
+func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration, maxSpread float64) ([]ScalpingCoin, error) {
+	// Use a timeout context to prevent indefinite hanging
+	// Default timeout: 30 minutes (enough for analyzing many assets with rate limiting)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	// Default values
+	if quoteAsset == "" {
+		quoteAsset = "USDT"
+	}
+	if minVolume <= 0 {
+		minVolume = 1000000 // Default: 1M in quote currency
+	}
+	if topN <= 0 {
+		topN = 10
+	}
+	if rateLimitDelay <= 0 {
+		rateLimitDelay = 100 * time.Millisecond // Binance allows faster rate limits than Swyftx
+	}
+	if maxSpread <= 0 {
+		maxSpread = 0.5 // Default: 0.5% maximum spread (tighter than Swyftx for better scalping)
+	}
+
+	quoteAsset = strings.ToUpper(quoteAsset)
+
+	// Get all trading pairs
+	tradingPairs, err := c.GetTradingPairs()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trading pairs: %w", err)
+	}
+
+	// Filter pairs by quote asset
+	var candidatePairs []common.TradingPair
+	for _, pair := range tradingPairs {
+		if strings.EqualFold(pair.QuoteAsset, quoteAsset) {
+			candidatePairs = append(candidatePairs, pair)
+		}
+	}
+
+	if len(candidatePairs) == 0 {
+		return nil, fmt.Errorf("no trading pairs found for quote asset %s", quoteAsset)
+	}
+
+	// Analyze each pair
+	var rankedCoins []ScalpingCoin
+	var allAnalyzedCoins []ScalpingCoin // Track all coins for fallback
+	since := time.Now().Add(-24 * time.Hour)
+
+	// Debug counters
+	var tickersFetched, candlesFetched, candlesInsufficient, volumeFiltered, volatilityFiltered, spreadFiltered int
+
+	var firstError error
+	var errorCount int
+	logger := common.DefaultLogger()
+
+	for i, pair := range candidatePairs {
+		// Check context cancellation before processing each pair
+		select {
+		case <-ctx.Done():
+			// Return partial results if context is cancelled
+			if len(rankedCoins) > 0 {
+				sort.Slice(rankedCoins, func(i, j int) bool {
+					return rankedCoins[i].Score > rankedCoins[j].Score
+				})
+				if len(rankedCoins) > topN {
+					rankedCoins = rankedCoins[:topN]
+				}
+				return rankedCoins, fmt.Errorf("context cancelled: %w", ctx.Err())
+			}
+			return nil, fmt.Errorf("context cancelled: %w", ctx.Err())
+		default:
+		}
+
+		// Rate limiting: add delay between requests (except for the first one)
+		if i > 0 {
+			// Use context-aware sleep that respects cancellation
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled during rate limiting: %w", ctx.Err())
+			case <-time.After(rateLimitDelay):
+				// Continue after delay
+			}
+		}
+
+		symbol := pair.Symbol
+
+		// Fetch 24h ticker first (more efficient - already has volume and bid/ask)
+		ticker, err := c.GetTicker(symbol)
+		if err != nil {
+			// Track first error for debugging
+			if firstError == nil {
+				firstError = err
+			}
+			errorCount++
+			// Log first few errors for debugging
+			if errorCount <= 3 {
+				logger.Debugf("GetTicker failed for %s: %v", symbol, err)
+			}
+			// Skip pairs that fail to fetch ticker
+			continue
+		}
+		tickersFetched++
+
+		// Get volume from ticker (24h volume in quote currency)
+		totalVolume := ticker.Volume
+
+		// Filter by minimum volume early (before expensive candle fetch)
+		if totalVolume < minVolume {
+			volumeFiltered++
+			continue
+		}
+
+		// Calculate spread from ticker
+		var spread float64
+		if ticker.Bid > 0 && ticker.Ask > 0 && ticker.Ask >= ticker.Bid {
+			midPrice := (ticker.Bid + ticker.Ask) / 2
+			if midPrice > 0 {
+				spread = ((ticker.Ask - ticker.Bid) / midPrice) * 100
+			}
+		}
+
+		// Filter by maximum spread early (before expensive candle fetch)
+		if spread > maxSpread {
+			spreadFiltered++
+			continue
+		}
+
+		// Fetch 24h of 1-minute candles for volatility calculation (1440 candles = 24 hours)
+		candles, err := c.GetCandles(symbol, "1m", since, 1440)
+		if err != nil {
+			// Track first error for debugging
+			if firstError == nil {
+				firstError = err
+			}
+			errorCount++
+			// Log first few errors for debugging
+			if errorCount <= 3 {
+				logger.Debugf("GetCandles failed for %s: %v", symbol, err)
+			}
+			// Skip pairs that fail to fetch candles
+			continue
+		}
+		candlesFetched++
+
+		if len(candles) < 2 {
+			candlesInsufficient++
+			continue
+		}
+
+		// Calculate volatility from close prices
+		volatility := calculateBinanceVolatility(candles)
+
+		// Filter by volatility
+		if volatility <= 0 {
+			volatilityFiltered++
+			continue
+		}
+
+		// Create coin entry
+		// Score calculation: volume * volatility / (1 + spread) to penalize wide spreads
+		spreadFactor := 1.0 + spread // Add 1 to avoid division by zero, penalize wide spreads
+		coin := ScalpingCoin{
+			Code:       pair.BaseAsset,
+			Name:       pair.BaseAsset, // Binance doesn't provide asset names in trading pairs
+			Symbol:     symbol,
+			Volume:     totalVolume,
+			Volatility: volatility,
+			Spread:     spread,
+			Score:      (totalVolume * volatility) / spreadFactor,
+		}
+
+		// Always track all analyzed coins for fallback
+		allAnalyzedCoins = append(allAnalyzedCoins, coin)
+
+		// Add to ranked coins if it meets all criteria
+		rankedCoins = append(rankedCoins, coin)
+	}
+
+	// Sort by score (descending)
+	sort.Slice(rankedCoins, func(i, j int) bool {
+		return rankedCoins[i].Score > rankedCoins[j].Score
+	})
+
+	// Debug logging
+	logger.Debugf("FindScalpingCoins: candidatePairs=%d, tickersFetched=%d, candlesFetched=%d, candlesInsufficient=%d, allAnalyzed=%d, volumeFiltered=%d, volatilityFiltered=%d, spreadFiltered=%d, ranked=%d",
+		len(candidatePairs), tickersFetched, candlesFetched, candlesInsufficient, len(allAnalyzedCoins), volumeFiltered, volatilityFiltered, spreadFiltered, len(rankedCoins))
+
+	// If no coins were analyzed at all, this indicates a problem
+	if len(allAnalyzedCoins) == 0 {
+		errMsg := fmt.Sprintf("no coins could be analyzed: candidatePairs=%d, tickersFetched=%d, candlesFetched=%d, candlesInsufficient=%d, errors=%d",
+			len(candidatePairs), tickersFetched, candlesFetched, candlesInsufficient, errorCount)
+		if firstError != nil {
+			errMsg += fmt.Sprintf(" - first error: %v", firstError)
+		}
+		return nil, fmt.Errorf("%s - check if GetTicker and GetCandles are working correctly", errMsg)
+	}
+
+	// If no coins meet the strict criteria, fall back to best available coin
+	if len(rankedCoins) == 0 && len(allAnalyzedCoins) > 0 {
+		// Sort all analyzed coins by volume (fallback to volume if no volatility)
+		sort.Slice(allAnalyzedCoins, func(i, j int) bool {
+			// Prefer coins with both volume and volatility, but fall back to volume
+			if allAnalyzedCoins[i].Volatility > 0 && allAnalyzedCoins[j].Volatility > 0 {
+				return allAnalyzedCoins[i].Score > allAnalyzedCoins[j].Score
+			}
+			if allAnalyzedCoins[i].Volatility > 0 {
+				return true
+			}
+			if allAnalyzedCoins[j].Volatility > 0 {
+				return false
+			}
+			return allAnalyzedCoins[i].Volume > allAnalyzedCoins[j].Volume
+		})
+		// Return at least the best coin
+		rankedCoins = []ScalpingCoin{allAnalyzedCoins[0]}
+	}
+
+	// Return top N
+	if len(rankedCoins) > topN {
+		rankedCoins = rankedCoins[:topN]
+	}
+
+	return rankedCoins, nil
+}
+
+// calculateBinanceVolatility calculates the daily volatility as the standard deviation of log returns.
+// Returns volatility as a percentage.
+func calculateBinanceVolatility(candles []models.Candle) float64 {
+	if len(candles) < 2 {
+		return 0
+	}
+
+	// Extract close prices
+	prices := make([]float64, 0, len(candles))
+	for _, candle := range candles {
+		if candle.Close > 0 {
+			prices = append(prices, candle.Close)
+		}
+	}
+
+	if len(prices) < 2 {
+		return 0
+	}
+
+	// Calculate log returns
+	logReturns := make([]float64, 0, len(prices)-1)
+	for i := 0; i < len(prices)-1; i++ {
+		if prices[i] > 0 {
+			logReturns = append(logReturns, math.Log(prices[i+1]/prices[i]))
+		}
+	}
+
+	if len(logReturns) < 2 {
+		return 0
+	}
+
+	// Calculate mean
+	var sum float64
+	for _, ret := range logReturns {
+		sum += ret
+	}
+	mean := sum / float64(len(logReturns))
+
+	// Calculate variance
+	var variance float64
+	for _, ret := range logReturns {
+		diff := ret - mean
+		variance += diff * diff
+	}
+	variance /= float64(len(logReturns))
+
+	// Standard deviation (volatility) as percentage
+	stdDev := math.Sqrt(variance) * 100
+
+	return stdDev
 }
 
 // FetchFundingRate fetches the current funding rate for a futures symbol
