@@ -894,7 +894,8 @@ func (c *SwyftxClient) GetTicker(symbol string) (*models.Ticker, error) {
 
 // FetchMarketData returns a simplified OHLC snapshot using public ticker endpoints.
 func (c *SwyftxClient) FetchMarketData(symbol string) (models.MarketData, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return models.MarketData{}, err
@@ -1054,7 +1055,8 @@ type swyftxRateResponse struct {
 // GetOrderBook attempts to fetch the authenticated order book. If authentication
 // fails, it falls back to a synthetic book derived from ticker data.
 func (c *SwyftxClient) GetOrderBook(symbol string, depth int) (*models.OrderBook, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -1062,7 +1064,7 @@ func (c *SwyftxClient) GetOrderBook(symbol string, depth int) (*models.OrderBook
 	path := fmt.Sprintf("/orderbook/%s/%s/", strings.ToUpper(baseAsset.Code), strings.ToUpper(quoteAsset.Code))
 	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
 	if err != nil {
-		return c.syntheticOrderBook(symbol, baseAsset, quoteAsset)
+		return c.syntheticOrderBook(ctx, symbol, baseAsset, quoteAsset)
 	}
 	var resp swyftxOrderBookResponse
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -1087,8 +1089,8 @@ func (c *SwyftxClient) GetOrderBook(symbol string, depth int) (*models.OrderBook
 	}, nil
 }
 
-func (c *SwyftxClient) syntheticOrderBook(symbol string, base, quote *swyftxAsset) (*models.OrderBook, error) {
-	info, err := c.getBasicMarketInfo(context.Background(), base.Code)
+func (c *SwyftxClient) syntheticOrderBook(ctx context.Context, symbol string, base, quote *swyftxAsset) (*models.OrderBook, error) {
+	info, err := c.getBasicMarketInfo(ctx, base.Code)
 	if err != nil {
 		return nil, err
 	}
@@ -1310,7 +1312,8 @@ func (c *SwyftxClient) GetCandles(symbol, interval string, since time.Time, limi
 //   - interval: Time interval (e.g., "1m", "5m", "1h")
 //   - side: "ask" or "bid" (defaults to "bid" if empty)
 func (c *SwyftxClient) GetLatestBar(symbol, interval, side string) (*models.Candle, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -1469,7 +1472,8 @@ func (c *SwyftxClient) GetTrades(symbol string, since time.Time, limit int) ([]m
 // GetTradesWithPagination returns historical trade-like records with pagination support.
 // page parameter: 0 or negative means no pagination, positive values are one-based (page 1 is first page).
 func (c *SwyftxClient) GetTradesWithPagination(symbol string, since time.Time, limit, page int) ([]models.Trade, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -1558,7 +1562,8 @@ func (c *SwyftxClient) GetBalance(currency string) (*common.Balance, error) {
 
 // GetBalances returns all balances.
 func (c *SwyftxClient) GetBalances() (map[string]*common.Balance, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	if err := c.ensureAssets(ctx); err != nil {
 		return nil, err
 	}
@@ -1593,7 +1598,8 @@ func (c *SwyftxClient) GetBalances() (map[string]*common.Balance, error) {
 
 // CreateOrder submits a new order using the /orders/ endpoint.
 func (c *SwyftxClient) CreateOrder(symbol string, side common.OrderSide, orderType common.OrderType, amount, price float64) (*common.Order, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	baseAsset, quoteAsset, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -1746,8 +1752,10 @@ func mapSwyftxOrderTypeToGeneric(orderType int) common.OrderType {
 
 // GetOrder retrieves a specific order by UUID.
 func (c *SwyftxClient) GetOrder(symbol, orderID string) (*common.Order, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	path := fmt.Sprintf("/orders/byId/%s", orderID)
-	data, err := c.doRequest(context.Background(), http.MethodGet, path, nil, true)
+	data, err := c.doRequest(ctx, http.MethodGet, path, nil, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1779,7 +1787,8 @@ func (c *SwyftxClient) GetOrders(symbol string, since time.Time, limit int) ([]c
 // GetOrdersWithPagination returns orders for a symbol with pagination support.
 // page parameter: 0 or negative means no pagination, positive values are one-based (page 1 is first page).
 func (c *SwyftxClient) GetOrdersWithPagination(symbol string, since time.Time, limit, page int) ([]common.Order, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	baseAsset, _, err := c.resolveSymbol(ctx, symbol)
 	if err != nil {
 		return nil, err
@@ -1816,8 +1825,10 @@ func (c *SwyftxClient) GetOrdersWithPagination(symbol string, since time.Time, l
 
 // CancelOrder cancels an order by UUID.
 func (c *SwyftxClient) CancelOrder(symbol, orderID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	path := fmt.Sprintf("/orders/%s/", orderID)
-	_, err := c.doRequest(context.Background(), http.MethodDelete, path, nil, true)
+	_, err := c.doRequest(ctx, http.MethodDelete, path, nil, true)
 	return err
 }
 
