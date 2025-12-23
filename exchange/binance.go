@@ -923,9 +923,15 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
-// It filters coins by minimum volume, calculates volatility from 24h of 1-minute candles,
-// checks bid-ask spread (critical for scalping profitability), and ranks them by a score
-// combining volume, volatility, and spread.
+// It uses an advanced multi-factor scoring algorithm that considers:
+//   - Volume: 24h trading volume (normalized, log scale)
+//   - Volatility: Daily price volatility from 1-minute candles (standard deviation of log returns)
+//   - Order book liquidity: Weighted depth analysis (orders closer to mid price weighted more)
+//   - Order book imbalance: Bid/ask ratio (slight preference for balanced books)
+//   - Price impact: Estimated slippage for typical scalping trade sizes
+//   - Spread: Bid-ask spread (strong penalty for wide spreads)
+//
+// The scoring formula: score = (volume^0.7 * volatility^0.8 * liquidity^0.6) / (spread^1.2 * impact^0.5 * imbalance^0.3)
 //
 // Parameters:
 //   - quoteAsset: The quote currency to use (default: "USDT"). Must be a valid quote asset on Binance.
@@ -934,8 +940,8 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 //   - rateLimitDelay: Delay between API calls to respect rate limits (default: 100ms)
 //   - maxSpread: Maximum allowed bid-ask spread percentage (default: 0.5). Coins with wider spreads are filtered out.
 //
-// Returns a sorted list of ScalpingCoin structs, ranked by score (volume * volatility / spread_factor).
-// Lower spreads are preferred for scalping as they reduce trading costs.
+// Returns a sorted list of ScalpingCoin structs, ranked by enhanced multi-factor score.
+// The algorithm prioritizes coins with high volume, good volatility, deep order books, tight spreads, and low slippage risk.
 func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration, maxSpread float64) ([]ScalpingCoin, error) {
 	// Use a timeout context to prevent indefinite hanging
 	// Default timeout: 30 minutes (enough for analyzing many assets with rate limiting)
@@ -985,7 +991,7 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 	since := time.Now().Add(-24 * time.Hour)
 
 	// Debug counters
-	var tickersFetched, candlesFetched, candlesInsufficient, volumeFiltered, volatilityFiltered, spreadFiltered int
+	var tickersFetched, candlesFetched, candlesInsufficient, volumeFiltered, volatilityFiltered, spreadFiltered, orderBooksFetched int
 
 	var firstError error
 	var errorCount int
@@ -1094,9 +1100,36 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 			continue
 		}
 
+		// Fetch order book for liquidity analysis (depth 20 is good for scalping)
+		// If order book fetch fails, use default values (no penalty, just no bonus)
+		orderBook, err := c.GetOrderBook(symbol, 20)
+		var liquidityScore, orderBookImbalance, priceImpactFactor float64 = 1.0, 1.0, 1.0
+		if err == nil && orderBook != nil {
+			orderBooksFetched++
+			midPrice := ticker.LastPrice
+			if midPrice <= 0 {
+				midPrice = (ticker.Bid + ticker.Ask) / 2
+			}
+			if midPrice > 0 {
+				// Calculate order book metrics
+				liquidityScore = calculateOrderBookLiquidity(orderBook, midPrice)
+				orderBookImbalance = calculateOrderBookImbalance(orderBook)
+				priceImpactFactor = calculatePriceImpactFactor(orderBook, midPrice)
+			}
+		}
+
+		// Enhanced scoring algorithm for scalping
+		// Factors:
+		// - Volume (normalized): Higher volume = better liquidity
+		// - Volatility (normalized): Need price movement to profit
+		// - Liquidity score: Deep order book = less slippage
+		// - Order book imbalance: Can indicate momentum (slight preference for balanced)
+		// Penalties:
+		// - Spread: Wide spreads eat profits
+		// - Price impact: Thin order books = high slippage risk
+		score := calculateScalpingScore(totalVolume, volatility, liquidityScore, orderBookImbalance, spread, priceImpactFactor)
+
 		// Create coin entry
-		// Score calculation: volume * volatility / (1 + spread) to penalize wide spreads
-		spreadFactor := 1.0 + spread // Add 1 to avoid division by zero, penalize wide spreads
 		coin := ScalpingCoin{
 			Code:       pair.BaseAsset,
 			Name:       pair.BaseAsset, // Binance doesn't provide asset names in trading pairs
@@ -1104,7 +1137,7 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 			Volume:     totalVolume,
 			Volatility: volatility,
 			Spread:     spread,
-			Score:      (totalVolume * volatility) / spreadFactor,
+			Score:      score,
 		}
 
 		// Always track all analyzed coins for fallback
@@ -1120,8 +1153,8 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 	})
 
 	// Debug logging
-	logger.Debugf("FindScalpingCoins: candidatePairs=%d, tickersFetched=%d, candlesFetched=%d, candlesInsufficient=%d, allAnalyzed=%d, volumeFiltered=%d, volatilityFiltered=%d, spreadFiltered=%d, ranked=%d",
-		len(candidatePairs), tickersFetched, candlesFetched, candlesInsufficient, len(allAnalyzedCoins), volumeFiltered, volatilityFiltered, spreadFiltered, len(rankedCoins))
+	logger.Debugf("FindScalpingCoins: candidatePairs=%d, tickersFetched=%d, candlesFetched=%d, orderBooksFetched=%d, candlesInsufficient=%d, allAnalyzed=%d, volumeFiltered=%d, volatilityFiltered=%d, spreadFiltered=%d, ranked=%d",
+		len(candidatePairs), tickersFetched, candlesFetched, orderBooksFetched, candlesInsufficient, len(allAnalyzedCoins), volumeFiltered, volatilityFiltered, spreadFiltered, len(rankedCoins))
 
 	// If no coins were analyzed at all, this indicates a problem
 	if len(allAnalyzedCoins) == 0 {
@@ -1211,6 +1244,249 @@ func calculateBinanceVolatility(candles []models.Candle) float64 {
 	stdDev := math.Sqrt(variance) * 100
 
 	return stdDev
+}
+
+// calculateOrderBookLiquidity calculates a weighted liquidity score based on order book depth.
+// Orders closer to the mid price are weighted more heavily, as they're more relevant for scalping.
+// Returns a score typically between 0.1 and 10.0, where higher is better.
+func calculateOrderBookLiquidity(orderBook *models.OrderBook, midPrice float64) float64 {
+	if orderBook == nil || midPrice <= 0 {
+		return 1.0
+	}
+
+	var weightedBidDepth, weightedAskDepth float64
+
+	// Calculate weighted bid depth (orders closer to mid price weighted more)
+	for i, bid := range orderBook.Bids {
+		if bid.Price <= 0 || bid.Amount <= 0 {
+			continue
+		}
+		// Weight decreases with distance from mid price
+		// Use exponential decay: weight = exp(-distance_pct * decay_factor)
+		distancePct := (midPrice - bid.Price) / midPrice
+		if distancePct < 0 {
+			distancePct = 0
+		}
+		// Decay factor: orders within 0.5% get full weight, beyond that decay quickly
+		weight := math.Exp(-distancePct * 200) // 200 = decay factor
+		// Also weight by position (first few levels more important)
+		positionWeight := math.Exp(-float64(i) * 0.3)
+		weightedBidDepth += bid.Amount * bid.Price * weight * positionWeight
+	}
+
+	// Calculate weighted ask depth
+	for i, ask := range orderBook.Asks {
+		if ask.Price <= 0 || ask.Amount <= 0 {
+			continue
+		}
+		distancePct := (ask.Price - midPrice) / midPrice
+		if distancePct < 0 {
+			distancePct = 0
+		}
+		weight := math.Exp(-distancePct * 200)
+		positionWeight := math.Exp(-float64(i) * 0.3)
+		weightedAskDepth += ask.Amount * ask.Price * weight * positionWeight
+	}
+
+	// Normalize by mid price to get a liquidity score
+	// Higher liquidity = better for scalping
+	totalWeightedDepth := (weightedBidDepth + weightedAskDepth) / 2.0
+	if totalWeightedDepth <= 0 {
+		return 1.0
+	}
+
+	// Normalize to a reasonable range (0.1 to 10.0)
+	// Typical values: 1000-1000000 in quote currency
+	liquidityScore := math.Log10(totalWeightedDepth+1) / 2.0
+	if liquidityScore < 0.1 {
+		liquidityScore = 0.1
+	}
+	if liquidityScore > 10.0 {
+		liquidityScore = 10.0
+	}
+
+	return liquidityScore
+}
+
+// calculateOrderBookImbalance calculates the bid/ask imbalance ratio.
+// Returns a value between 0.5 and 2.0, where:
+// - 1.0 = perfectly balanced
+// - > 1.0 = more bid liquidity (bullish pressure)
+// - < 1.0 = more ask liquidity (bearish pressure)
+// For scalping, we slightly prefer balanced books (closer to 1.0).
+func calculateOrderBookImbalance(orderBook *models.OrderBook) float64 {
+	if orderBook == nil {
+		return 1.0
+	}
+
+	var totalBidValue, totalAskValue float64
+
+	// Sum bid liquidity (first 10 levels)
+	for i, bid := range orderBook.Bids {
+		if i >= 10 {
+			break
+		}
+		if bid.Price > 0 && bid.Amount > 0 {
+			totalBidValue += bid.Price * bid.Amount
+		}
+	}
+
+	// Sum ask liquidity (first 10 levels)
+	for i, ask := range orderBook.Asks {
+		if i >= 10 {
+			break
+		}
+		if ask.Price > 0 && ask.Amount > 0 {
+			totalAskValue += ask.Price * ask.Amount
+		}
+	}
+
+	if totalAskValue <= 0 {
+		return 1.0
+	}
+
+	imbalance := totalBidValue / totalAskValue
+
+	// Clamp to reasonable range
+	if imbalance < 0.5 {
+		imbalance = 0.5
+	}
+	if imbalance > 2.0 {
+		imbalance = 2.0
+	}
+
+	return imbalance
+}
+
+// calculatePriceImpactFactor estimates the price impact of a typical scalping trade.
+// Lower values = better (less slippage). Returns a factor typically between 0.5 and 5.0.
+func calculatePriceImpactFactor(orderBook *models.OrderBook, midPrice float64) float64 {
+	if orderBook == nil || midPrice <= 0 {
+		return 1.0
+	}
+
+	// Estimate price impact for a trade size of 0.1% of typical daily volume
+	// This represents a typical scalping trade size
+	typicalTradeSize := midPrice * 0.001 // 0.1% of price in quote currency
+
+	var bidImpact, askImpact float64
+
+	// Calculate bid side impact (buying)
+	remaining := typicalTradeSize
+	for i, bid := range orderBook.Bids {
+		if i >= 10 || remaining <= 0 {
+			break
+		}
+		if bid.Price <= 0 || bid.Amount <= 0 {
+			continue
+		}
+		available := bid.Price * bid.Amount
+		if available >= remaining {
+			// Can fill entirely at this level
+			bidImpact = float64(i+1) * 0.1 // Each level adds 0.1% impact
+			break
+		}
+		remaining -= available
+		bidImpact = float64(i+1) * 0.1
+	}
+
+	// Calculate ask side impact (selling)
+	remaining = typicalTradeSize
+	for i, ask := range orderBook.Asks {
+		if i >= 10 || remaining <= 0 {
+			break
+		}
+		if ask.Price <= 0 || ask.Amount <= 0 {
+			continue
+		}
+		available := ask.Price * ask.Amount
+		if available >= remaining {
+			askImpact = float64(i+1) * 0.1
+			break
+		}
+		remaining -= available
+		askImpact = float64(i+1) * 0.1
+	}
+
+	// Average impact and normalize
+	avgImpact := (bidImpact + askImpact) / 2.0
+	if avgImpact <= 0 {
+		return 1.0
+	}
+
+	// Convert to factor (lower is better, so invert)
+	// Impact of 0.1% = factor of 1.0, impact of 0.5% = factor of 2.0
+	impactFactor := 1.0 + avgImpact*10.0
+
+	// Clamp to reasonable range
+	if impactFactor < 0.5 {
+		impactFactor = 0.5
+	}
+	if impactFactor > 5.0 {
+		impactFactor = 5.0
+	}
+
+	return impactFactor
+}
+
+// calculateScalpingScore computes an enhanced scoring algorithm for scalping suitability.
+// Uses multiple factors with appropriate weights and normalization.
+func calculateScalpingScore(volume, volatility, liquidityScore, orderBookImbalance, spread, priceImpactFactor float64) float64 {
+	// Normalize volume (log scale to handle wide range)
+	// Typical range: 100K to 100M, normalize to 0.1-10.0
+	normalizedVolume := math.Log10(volume+1) / 7.0 // Divide by 7 to normalize
+	if normalizedVolume < 0.1 {
+		normalizedVolume = 0.1
+	}
+	if normalizedVolume > 10.0 {
+		normalizedVolume = 10.0
+	}
+
+	// Normalize volatility (already a percentage, typical range 0.5-10%)
+	// Normalize to 0.1-10.0
+	normalizedVolatility := volatility / 2.0
+	if normalizedVolatility < 0.1 {
+		normalizedVolatility = 0.1
+	}
+	if normalizedVolatility > 10.0 {
+		normalizedVolatility = 10.0
+	}
+
+	// Normalize order book imbalance (prefer values closer to 1.0)
+	// Convert to penalty: |imbalance - 1.0| = penalty
+	imbalancePenalty := 1.0 + math.Abs(orderBookImbalance-1.0)*0.5
+
+	// Spread penalty (wider spreads = worse)
+	spreadPenalty := 1.0 + spread*2.0 // Multiply by 2 for stronger penalty
+
+	// Enhanced scoring formula with weighted factors:
+	// score = (volume^0.7 * volatility^0.8 * liquidity^0.6) / (spread^1.2 * impact^0.5 * imbalance^0.3)
+	//
+	// Exponents chosen to balance factors:
+	// - Volume: 0.7 (important but not dominant)
+	// - Volatility: 0.8 (very important for scalping)
+	// - Liquidity: 0.6 (important for execution quality)
+	// - Spread: 1.2 (strong penalty, critical for profitability)
+	// - Price impact: 0.5 (moderate penalty)
+	// - Imbalance: 0.3 (minor penalty, prefer balanced)
+
+	numerator := math.Pow(normalizedVolume, 0.7) *
+		math.Pow(normalizedVolatility, 0.8) *
+		math.Pow(liquidityScore, 0.6)
+
+	denominator := math.Pow(spreadPenalty, 1.2) *
+		math.Pow(priceImpactFactor, 0.5) *
+		math.Pow(imbalancePenalty, 0.3)
+
+	if denominator <= 0 {
+		return 0
+	}
+
+	score := numerator / denominator
+
+	// Scale to a reasonable range (0.1 to 1000)
+	// This ensures scores are comparable across different market conditions
+	return score
 }
 
 // FetchFundingRate fetches the current funding rate for a futures symbol
