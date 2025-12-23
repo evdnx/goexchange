@@ -146,7 +146,7 @@ func NewBinanceClient(apiKey, apiSecret string, testnet bool, metrics *metrics.M
 	}
 
 	client.httpClient = createBinanceHTTPClient(apiKey, metrics)
-	client.wsClient = NewBinanceWebSocketClient(wsURL, apiKey, apiSecret)
+	client.wsClient = NewBinanceWebSocketClient(wsURL, baseURL, apiKey, apiSecret, client.httpClient)
 	return client
 }
 
@@ -298,15 +298,47 @@ func (c *BinanceClient) FetchMarketData(symbol string) (models.MarketData, error
 
 	kline := klines[0]
 	if len(kline) < 7 {
-		return models.MarketData{}, errors.New("invalid kline data format")
+		return models.MarketData{}, fmt.Errorf("invalid kline data format: expected at least 7 elements, got %d", len(kline))
 	}
 
-	openTime := int64(kline[0].(float64))
-	open, _ := strconv.ParseFloat(kline[1].(string), 64)
-	high, _ := strconv.ParseFloat(kline[2].(string), 64)
-	low, _ := strconv.ParseFloat(kline[3].(string), 64)
-	close, _ := strconv.ParseFloat(kline[4].(string), 64)
-	volume, _ := strconv.ParseFloat(kline[5].(string), 64)
+	// Safely extract openTime
+	var openTime int64
+	switch v := kline[0].(type) {
+	case float64:
+		openTime = int64(v)
+	case int64:
+		openTime = v
+	default:
+		return models.MarketData{}, fmt.Errorf("invalid kline openTime type: %T", kline[0])
+	}
+
+	// Safely extract string values
+	openStr, ok := kline[1].(string)
+	if !ok {
+		return models.MarketData{}, fmt.Errorf("invalid kline open type: %T", kline[1])
+	}
+	highStr, ok := kline[2].(string)
+	if !ok {
+		return models.MarketData{}, fmt.Errorf("invalid kline high type: %T", kline[2])
+	}
+	lowStr, ok := kline[3].(string)
+	if !ok {
+		return models.MarketData{}, fmt.Errorf("invalid kline low type: %T", kline[3])
+	}
+	closeStr, ok := kline[4].(string)
+	if !ok {
+		return models.MarketData{}, fmt.Errorf("invalid kline close type: %T", kline[4])
+	}
+	volumeStr, ok := kline[5].(string)
+	if !ok {
+		return models.MarketData{}, fmt.Errorf("invalid kline volume type: %T", kline[5])
+	}
+
+	open, _ := strconv.ParseFloat(openStr, 64)
+	high, _ := strconv.ParseFloat(highStr, 64)
+	low, _ := strconv.ParseFloat(lowStr, 64)
+	close, _ := strconv.ParseFloat(closeStr, 64)
+	volume, _ := strconv.ParseFloat(volumeStr, 64)
 
 	return models.MarketData{
 		Symbol:    symbol,
@@ -372,7 +404,19 @@ func (c *BinanceClient) GetCandles(symbol, interval string, since time.Time, lim
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 	params.Add("interval", interval)
-	params.Add("startTime", strconv.FormatInt(since.UnixNano()/int64(time.Millisecond), 10))
+
+	// Only add startTime if since is not zero
+	if !since.IsZero() {
+		params.Add("startTime", strconv.FormatInt(since.UnixNano()/int64(time.Millisecond), 10))
+	}
+
+	// Validate and limit the limit parameter (Binance max is 1000)
+	if limit <= 0 {
+		limit = 500 // Default limit
+	}
+	if limit > 1000 {
+		limit = 1000 // Binance maximum
+	}
 	params.Add("limit", strconv.Itoa(limit))
 
 	response, err := c.doGet(endpoint + "?" + params.Encode())
@@ -388,16 +432,58 @@ func (c *BinanceClient) GetCandles(symbol, interval string, since time.Time, lim
 	candles := make([]models.Candle, len(klines))
 	for i, kline := range klines {
 		if len(kline) < 7 {
-			return nil, fmt.Errorf("invalid kline data format")
+			return nil, fmt.Errorf("invalid kline data format: expected at least 7 elements, got %d", len(kline))
 		}
 
-		openTime := int64(kline[0].(float64))
-		open, _ := strconv.ParseFloat(kline[1].(string), 64)
-		high, _ := strconv.ParseFloat(kline[2].(string), 64)
-		low, _ := strconv.ParseFloat(kline[3].(string), 64)
-		close, _ := strconv.ParseFloat(kline[4].(string), 64)
-		volume, _ := strconv.ParseFloat(kline[5].(string), 64)
-		closeTime := int64(kline[6].(float64))
+		// Safely extract openTime (can be float64 or int64 from JSON)
+		var openTime int64
+		switch v := kline[0].(type) {
+		case float64:
+			openTime = int64(v)
+		case int64:
+			openTime = v
+		default:
+			return nil, fmt.Errorf("invalid kline openTime type: %T", kline[0])
+		}
+
+		// Safely extract string values
+		openStr, ok := kline[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid kline open type: %T", kline[1])
+		}
+		highStr, ok := kline[2].(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid kline high type: %T", kline[2])
+		}
+		lowStr, ok := kline[3].(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid kline low type: %T", kline[3])
+		}
+		closeStr, ok := kline[4].(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid kline close type: %T", kline[4])
+		}
+		volumeStr, ok := kline[5].(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid kline volume type: %T", kline[5])
+		}
+
+		open, _ := strconv.ParseFloat(openStr, 64)
+		high, _ := strconv.ParseFloat(highStr, 64)
+		low, _ := strconv.ParseFloat(lowStr, 64)
+		close, _ := strconv.ParseFloat(closeStr, 64)
+		volume, _ := strconv.ParseFloat(volumeStr, 64)
+
+		// Safely extract closeTime
+		var closeTime int64
+		switch v := kline[6].(type) {
+		case float64:
+			closeTime = int64(v)
+		case int64:
+			closeTime = v
+		default:
+			return nil, fmt.Errorf("invalid kline closeTime type: %T", kline[6])
+		}
 
 		candles[i] = models.Candle{
 			Exchange:  c.GetName(),
@@ -465,12 +551,32 @@ func (c *BinanceClient) GetTrades(symbol string, since time.Time, limit int) ([]
 }
 
 // GetOrderBook returns the order book for a symbol
+// Binance supports depths: 5, 10, 20, 50, 100, 500, 1000, 5000
 func (c *BinanceClient) GetOrderBook(symbol string, depth int) (*models.OrderBook, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
 	endpoint := fmt.Sprintf("%s/api/v3/depth", c.baseURL)
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
-	params.Add("limit", strconv.Itoa(depth))
+
+	// Validate and normalize depth to Binance-supported values
+	if depth <= 0 {
+		depth = 20 // Default depth
+	}
+	// Binance supports: 5, 10, 20, 50, 100, 500, 1000, 5000
+	// Round to nearest supported value
+	validDepths := []int{5, 10, 20, 50, 100, 500, 1000, 5000}
+	closestDepth := validDepths[0]
+	for _, validDepth := range validDepths {
+		if depth >= validDepth {
+			closestDepth = validDepth
+		} else {
+			break
+		}
+	}
+	if depth > 5000 {
+		closestDepth = 5000
+	}
+	params.Add("limit", strconv.Itoa(closestDepth))
 
 	response, err := c.doGet(endpoint + "?" + params.Encode())
 	if err != nil {
@@ -536,6 +642,9 @@ func (c *BinanceClient) PlaceOrder(order common.Order) (string, error) {
 	if quantity == 0 {
 		quantity = order.Quantity
 	}
+	if quantity <= 0 {
+		return "", fmt.Errorf("order quantity must be greater than 0")
+	}
 	params.Add("quantity", strconv.FormatFloat(quantity, 'f', -1, 64))
 
 	if order.Price > 0 {
@@ -582,6 +691,9 @@ func (c *BinanceClient) PlaceFuturesOrder(order FuturesOrder) (string, error) {
 	quantity := order.Amount
 	if quantity == 0 {
 		quantity = order.Quantity
+	}
+	if quantity <= 0 {
+		return "", fmt.Errorf("order quantity must be greater than 0")
 	}
 	params.Add("quantity", strconv.FormatFloat(quantity, 'f', -1, 64))
 
@@ -842,7 +954,19 @@ func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]
 	endpoint := fmt.Sprintf("%s/api/v3/allOrders", c.baseURL)
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
-	params.Add("startTime", strconv.FormatInt(since.UnixNano()/int64(time.Millisecond), 10))
+
+	// Only add startTime if since is not zero
+	if !since.IsZero() {
+		params.Add("startTime", strconv.FormatInt(since.UnixNano()/int64(time.Millisecond), 10))
+	}
+
+	// Validate limit (Binance max is 1000)
+	if limit <= 0 {
+		limit = 500 // Default limit
+	}
+	if limit > 1000 {
+		limit = 1000 // Binance maximum
+	}
 	params.Add("limit", strconv.Itoa(limit))
 	params = c.addSignature(params)
 
@@ -1720,8 +1844,26 @@ func (c *BinanceClient) SetLeverage(symbol string, leverage int) error {
 		return fmt.Errorf("failed to parse leverage response: %w", err)
 	}
 
-	if code, exists := respMap["code"]; exists && code.(float64) != 0 {
-		return fmt.Errorf("leverage error: %s", respMap["msg"].(string))
+	if code, exists := respMap["code"]; exists {
+		var codeValue float64
+		switch v := code.(type) {
+		case float64:
+			codeValue = v
+		case int:
+			codeValue = float64(v)
+		case int64:
+			codeValue = float64(v)
+		default:
+			// If code exists but is not a number, check if it's non-zero
+			return fmt.Errorf("leverage error: unexpected code type: %T", code)
+		}
+		if codeValue != 0 {
+			msg, _ := respMap["msg"].(string)
+			if msg == "" {
+				msg = "unknown error"
+			}
+			return fmt.Errorf("leverage error: %s", msg)
+		}
 	}
 
 	return nil
@@ -1753,8 +1895,26 @@ func (c *BinanceClient) SetMarginType(symbol string, marginType string) error {
 		return fmt.Errorf("failed to parse margin type response: %w", err)
 	}
 
-	if code, exists := respMap["code"]; exists && code.(float64) != 0 && code.(float64) != 200 {
-		return fmt.Errorf("margin type error: %s", respMap["msg"].(string))
+	if code, exists := respMap["code"]; exists {
+		var codeValue float64
+		switch v := code.(type) {
+		case float64:
+			codeValue = v
+		case int:
+			codeValue = float64(v)
+		case int64:
+			codeValue = float64(v)
+		default:
+			// If code exists but is not a number, check if it's non-zero
+			return fmt.Errorf("margin type error: unexpected code type: %T", code)
+		}
+		if codeValue != 0 && codeValue != 200 {
+			msg, _ := respMap["msg"].(string)
+			if msg == "" {
+				msg = "unknown error"
+			}
+			return fmt.Errorf("margin type error: %s", msg)
+		}
 	}
 
 	return nil
@@ -1814,6 +1974,10 @@ type BinanceWebSocketClient struct {
 	currentURL string
 	connected  bool
 	logger     *golog.Logger
+
+	// HTTP client and base URL for REST API calls (e.g., listen key)
+	httpClient  *gohttpcl.Client
+	restBaseURL string
 }
 
 const (
@@ -1936,7 +2100,7 @@ func (s *BinanceUserDataSubscription) Subscribe(sender wsMessageSender) error {
 }
 
 // NewBinanceWebSocketClient creates a new WebSocket client
-func NewBinanceWebSocketClient(wsURL, apiKey, apiSecret string) *BinanceWebSocketClient {
+func NewBinanceWebSocketClient(wsURL, restBaseURL, apiKey, apiSecret string, httpClient *gohttpcl.Client) *BinanceWebSocketClient {
 	client := &BinanceWebSocketClient{
 		apiKey:        apiKey,
 		apiSecret:     apiSecret,
@@ -1945,6 +2109,8 @@ func NewBinanceWebSocketClient(wsURL, apiKey, apiSecret string) *BinanceWebSocke
 		baseURL:       wsURL,
 		currentURL:    wsURL,
 		logger:        common.DefaultLogger(),
+		httpClient:    httpClient,
+		restBaseURL:   restBaseURL,
 	}
 	client.replaceClient(wsURL)
 	return client
@@ -2268,9 +2434,156 @@ func (c *BinanceWebSocketClient) SubscribeToUserData(callback func(models.UserDa
 }
 
 // getListenKey retrieves a listen key for user data streams.
-// TODO: implement the actual REST call to fetch a listen key.
+// Binance API: POST /api/v3/userDataStream (spot) or POST /fapi/v1/listenKey (futures)
+// The listen key is valid for 60 minutes and should be kept alive with PUT requests.
 func (c *BinanceWebSocketClient) getListenKey() (string, error) {
-	return "placeholder_listen_key", nil
+	if c.httpClient == nil {
+		return "", fmt.Errorf("HTTP client not available for listen key request")
+	}
+	if c.restBaseURL == "" {
+		return "", fmt.Errorf("REST base URL not configured")
+	}
+	if c.apiKey == "" {
+		return "", fmt.Errorf("API key required for user data stream")
+	}
+
+	// Use spot API endpoint for user data stream
+	// For futures, this would be /fapi/v1/listenKey, but we'll use spot for now
+	endpoint := fmt.Sprintf("%s/api/v3/userDataStream", c.restBaseURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create request with X-MBX-APIKEY header
+	// Note: userDataStream endpoint does NOT require signature, only API key
+	headers := map[string]string{
+		"X-MBX-APIKEY": c.apiKey,
+		"Content-Type": "application/json",
+	}
+	options := headerOptions(headers)
+
+	// Make POST request (empty body)
+	resp, err := c.httpClient.Post(ctx, endpoint, bytes.NewReader(nil), binanceHTTPTimeout, nil, options...)
+	if err != nil {
+		return "", fmt.Errorf("failed to request listen key: %w", err)
+	}
+	defer resp.Body.Close()
+
+	payload, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return "", fmt.Errorf("failed to read listen key response: %w", readErr)
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", common.NewExchangeHTTPError(resp.StatusCode, payload, string(payload))
+	}
+
+	// Parse response: {"listenKey": "..."}
+	var listenKeyResp struct {
+		ListenKey string `json:"listenKey"`
+	}
+	if err := json.Unmarshal(payload, &listenKeyResp); err != nil {
+		return "", fmt.Errorf("failed to parse listen key response: %w", err)
+	}
+
+	if listenKeyResp.ListenKey == "" {
+		return "", fmt.Errorf("empty listen key in response")
+	}
+
+	return listenKeyResp.ListenKey, nil
+}
+
+// keepAliveListenKey extends the validity of a listen key.
+// Binance listen keys expire after 60 minutes. This should be called periodically (e.g., every 30 minutes).
+// Binance API: PUT /api/v3/userDataStream?listenKey=...
+func (c *BinanceWebSocketClient) keepAliveListenKey(listenKey string) error {
+	if c.httpClient == nil {
+		return fmt.Errorf("HTTP client not available for listen key keep-alive")
+	}
+	if c.restBaseURL == "" {
+		return fmt.Errorf("REST base URL not configured")
+	}
+	if c.apiKey == "" {
+		return fmt.Errorf("API key required")
+	}
+	if listenKey == "" {
+		return fmt.Errorf("listen key required")
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v3/userDataStream?listenKey=%s", c.restBaseURL, url.QueryEscape(listenKey))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	headers := map[string]string{
+		"X-MBX-APIKEY": c.apiKey,
+		"Content-Type": "application/json",
+	}
+	options := headerOptions(headers)
+
+	// Make PUT request (empty body)
+	resp, err := c.httpClient.Put(ctx, endpoint, bytes.NewReader(nil), binanceHTTPTimeout, nil, options...)
+	if err != nil {
+		return fmt.Errorf("failed to keep listen key alive: %w", err)
+	}
+	defer resp.Body.Close()
+
+	payload, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("failed to read keep-alive response: %w", readErr)
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return common.NewExchangeHTTPError(resp.StatusCode, payload, string(payload))
+	}
+
+	return nil
+}
+
+// closeListenKey closes and invalidates a listen key.
+// Binance API: DELETE /api/v3/userDataStream?listenKey=...
+func (c *BinanceWebSocketClient) closeListenKey(listenKey string) error {
+	if c.httpClient == nil {
+		return fmt.Errorf("HTTP client not available for listen key close")
+	}
+	if c.restBaseURL == "" {
+		return fmt.Errorf("REST base URL not configured")
+	}
+	if c.apiKey == "" {
+		return fmt.Errorf("API key required")
+	}
+	if listenKey == "" {
+		return fmt.Errorf("listen key required")
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v3/userDataStream?listenKey=%s", c.restBaseURL, url.QueryEscape(listenKey))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	headers := map[string]string{
+		"X-MBX-APIKEY": c.apiKey,
+		"Content-Type": "application/json",
+	}
+	options := headerOptions(headers)
+
+	// Make DELETE request
+	resp, err := c.httpClient.Delete(ctx, endpoint, binanceHTTPTimeout, nil, options...)
+	if err != nil {
+		return fmt.Errorf("failed to close listen key: %w", err)
+	}
+	defer resp.Body.Close()
+
+	payload, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("failed to read close response: %w", readErr)
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return common.NewExchangeHTTPError(resp.StatusCode, payload, string(payload))
+	}
+
+	return nil
 }
 
 // restoreSubscriptions restores WebSocket subscriptions after reconnection
