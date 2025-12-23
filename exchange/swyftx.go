@@ -550,7 +550,11 @@ type ScalpingCoin struct {
 // Returns a sorted list of ScalpingCoin structs, ranked by score (volume * volatility / spread_factor).
 // Lower spreads are preferred for scalping as they reduce trading costs.
 func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration, maxSpread float64) ([]ScalpingCoin, error) {
-	ctx := context.Background()
+	// Use a timeout context to prevent indefinite hanging
+	// Default timeout: 30 minutes (enough for analyzing many assets with rate limiting)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
 	if err := c.ensureAssets(ctx); err != nil {
 		return nil, err
 	}
@@ -580,8 +584,8 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 		return nil, fmt.Errorf("quote asset %s not found or not a primary asset", quoteAsset)
 	}
 
-	// Get all active secondary assets (bases) that can be traded
-	var secondaryAssets []*swyftxAsset
+	// Collect candidate assets first (without API calls) to minimize lock time
+	var candidateAssets []*swyftxAsset
 	for _, asset := range c.assets {
 		if bool(asset.Secondary) &&
 			asset.ID != quote.ID &&
@@ -589,13 +593,25 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 			bool(asset.WithdrawEnabled) &&
 			!bool(asset.Delisting) &&
 			!bool(asset.BuyDisabled) {
-			// Verify the asset is actually tradable by checking with the API
-			if c.isAssetTradable(ctx, asset.Code, quoteAsset) {
-				secondaryAssets = append(secondaryAssets, asset)
-			}
+			candidateAssets = append(candidateAssets, asset)
 		}
 	}
 	c.assetMu.RUnlock()
+
+	// Verify tradability outside the lock to avoid blocking
+	var secondaryAssets []*swyftxAsset
+	for _, asset := range candidateAssets {
+		// Check context cancellation before each API call
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled while checking tradability: %w", ctx.Err())
+		default:
+		}
+		// Verify the asset is actually tradable by checking with the API
+		if c.isAssetTradable(ctx, asset.Code, quoteAsset) {
+			secondaryAssets = append(secondaryAssets, asset)
+		}
+	}
 
 	if len(secondaryAssets) == 0 {
 		return nil, fmt.Errorf("no active secondary assets found for quote %s", quoteAsset)
@@ -613,9 +629,32 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 	var errorCount int
 
 	for i, asset := range secondaryAssets {
+		// Check context cancellation before processing each asset
+		select {
+		case <-ctx.Done():
+			// Return partial results if context is cancelled
+			if len(rankedCoins) > 0 {
+				sort.Slice(rankedCoins, func(i, j int) bool {
+					return rankedCoins[i].Score > rankedCoins[j].Score
+				})
+				if len(rankedCoins) > topN {
+					rankedCoins = rankedCoins[:topN]
+				}
+				return rankedCoins, fmt.Errorf("context cancelled: %w", ctx.Err())
+			}
+			return nil, fmt.Errorf("context cancelled: %w", ctx.Err())
+		default:
+		}
+
 		// Rate limiting: add delay between requests (except for the first one)
 		if i > 0 {
-			time.Sleep(rateLimitDelay)
+			// Use context-aware sleep that respects cancellation
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled during rate limiting: %w", ctx.Err())
+			case <-time.After(rateLimitDelay):
+				// Continue after delay
+			}
 		}
 
 		symbol := fmt.Sprintf("%s/%s", asset.Code, quoteAsset)
@@ -958,11 +997,26 @@ func (c *SwyftxClient) callRate(ctx context.Context, buy, sell string, amount fl
 // isAssetTradable checks if a base asset can be traded against a quote asset by attempting
 // to fetch market info and rate data. Returns true if the asset is tradable, false otherwise.
 func (c *SwyftxClient) isAssetTradable(ctx context.Context, baseCode, quoteCode string) bool {
+	// Check context cancellation before making API calls
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+
 	// Try to get basic market info first
 	_, err := c.getBasicMarketInfo(ctx, baseCode)
 	if err != nil {
 		return false
 	}
+
+	// Check context cancellation again before second API call
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+
 	// Try to call rate API to verify tradability
 	_, err = c.callRate(ctx, baseCode, quoteCode, swyftxDefaultRateAmount)
 	if err != nil {
