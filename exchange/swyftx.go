@@ -531,21 +531,25 @@ type ScalpingCoin struct {
 	Symbol     string  // Trading pair symbol (e.g., "XRP/AUD")
 	Volume     float64 // 24h volume in quote currency (AUD)
 	Volatility float64 // Daily volatility percentage (std dev of log returns)
-	Score      float64 // Ranking score (volume * volatility)
+	Spread     float64 // Bid-ask spread percentage ((ask - bid) / mid * 100)
+	Score      float64 // Ranking score (volume * volatility / spread_factor)
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
 // It filters coins by minimum volume, calculates volatility from 24h of 1-minute candles,
-// and ranks them by a score combining volume and volatility.
+// checks bid-ask spread (critical for scalping profitability), and ranks them by a score
+// combining volume, volatility, and spread.
 //
 // Parameters:
 //   - quoteAsset: The quote currency to use (default: "AUD"). Must be a primary asset.
 //   - minVolume: Minimum 24h volume threshold in quote currency (default: 500000)
 //   - topN: Number of top coins to return (default: 10)
 //   - rateLimitDelay: Delay between API calls to respect rate limits in milliseconds (default: 200ms)
+//   - maxSpread: Maximum allowed bid-ask spread percentage (default: 1.0). Coins with wider spreads are filtered out.
 //
-// Returns a sorted list of ScalpingCoin structs, ranked by score (volume * volatility).
-func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration) ([]ScalpingCoin, error) {
+// Returns a sorted list of ScalpingCoin structs, ranked by score (volume * volatility / spread_factor).
+// Lower spreads are preferred for scalping as they reduce trading costs.
+func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration, maxSpread float64) ([]ScalpingCoin, error) {
 	ctx := context.Background()
 	if err := c.ensureAssets(ctx); err != nil {
 		return nil, err
@@ -563,6 +567,9 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 	}
 	if rateLimitDelay <= 0 {
 		rateLimitDelay = 200 * time.Millisecond
+	}
+	if maxSpread <= 0 {
+		maxSpread = 1.0 // Default: 1% maximum spread
 	}
 
 	quoteAsset = strings.ToUpper(quoteAsset)
@@ -600,7 +607,7 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 	since := time.Now().Add(-24 * time.Hour)
 
 	// Debug counters
-	var candlesFetched, candlesInsufficient, volumeFiltered, volatilityFiltered int
+	var candlesFetched, candlesInsufficient, volumeFiltered, volatilityFiltered, spreadFiltered int
 
 	var firstError error
 	var errorCount int
@@ -641,14 +648,32 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 		// Calculate volatility from close prices
 		volatility := calculateVolatility(candles)
 
+		// Fetch ticker to get bid/ask spread (critical for scalping)
+		var spread float64
+		ticker, err := c.GetTicker(symbol)
+		if err != nil {
+			// If we can't get ticker, skip this coin (spread is critical for scalping)
+			c.logger.Debugf("GetTicker failed for %s: %v", symbol, err)
+			continue
+		}
+		if ticker.Bid > 0 && ticker.Ask > 0 && ticker.Ask >= ticker.Bid {
+			midPrice := (ticker.Bid + ticker.Ask) / 2
+			if midPrice > 0 {
+				spread = ((ticker.Ask - ticker.Bid) / midPrice) * 100
+			}
+		}
+
 		// Create coin entry (even if it doesn't meet all criteria)
+		// Score calculation: volume * volatility / (1 + spread) to penalize wide spreads
+		spreadFactor := 1.0 + spread // Add 1 to avoid division by zero, penalize wide spreads
 		coin := ScalpingCoin{
 			Code:       asset.Code,
 			Name:       asset.Name,
 			Symbol:     symbol,
 			Volume:     totalVolume,
 			Volatility: volatility,
-			Score:      totalVolume * volatility,
+			Spread:     spread,
+			Score:      (totalVolume * volatility) / spreadFactor,
 		}
 
 		// Always track all analyzed coins for fallback
@@ -666,6 +691,12 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 			continue
 		}
 
+		// Filter by maximum spread (critical for scalping - wide spreads eat profits)
+		if spread > maxSpread {
+			spreadFiltered++
+			continue
+		}
+
 		// Add to ranked coins if it meets all criteria
 		rankedCoins = append(rankedCoins, coin)
 	}
@@ -676,8 +707,8 @@ func (c *SwyftxClient) FindScalpingCoins(quoteAsset string, minVolume float64, t
 	})
 
 	// Debug logging
-	c.logger.Debugf("FindScalpingCoins: secondaryAssets=%d, candlesFetched=%d, candlesInsufficient=%d, allAnalyzed=%d, volumeFiltered=%d, volatilityFiltered=%d, ranked=%d",
-		len(secondaryAssets), candlesFetched, candlesInsufficient, len(allAnalyzedCoins), volumeFiltered, volatilityFiltered, len(rankedCoins))
+	c.logger.Debugf("FindScalpingCoins: secondaryAssets=%d, candlesFetched=%d, candlesInsufficient=%d, allAnalyzed=%d, volumeFiltered=%d, volatilityFiltered=%d, spreadFiltered=%d, ranked=%d",
+		len(secondaryAssets), candlesFetched, candlesInsufficient, len(allAnalyzedCoins), volumeFiltered, volatilityFiltered, spreadFiltered, len(rankedCoins))
 
 	// If no coins were analyzed at all, this indicates a problem
 	if len(allAnalyzedCoins) == 0 {

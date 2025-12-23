@@ -166,7 +166,8 @@ func TestSwyftxFindScalpingCoins(t *testing.T) {
 	t.Logf("Found %d total trading pairs", len(pairs))
 	fmt.Printf("Found %d total trading pairs\n", len(pairs))
 
-	coins, err := client.FindScalpingCoins("AUD", 1000, 10, 200*time.Millisecond)
+	// Test with maxSpread of 1.0% (default)
+	coins, err := client.FindScalpingCoins("AUD", 1000, 10, 200*time.Millisecond, 1.0)
 	if err != nil {
 		t.Logf("Error details: %v", err)
 		fmt.Printf("Error details: %v\n", err)
@@ -181,13 +182,14 @@ func TestSwyftxFindScalpingCoins(t *testing.T) {
 	}
 
 	for i, coin := range coins {
-		coinInfo := fmt.Sprintf("%d. %s (%s)\n   Symbol: %s\n   Volume: %.2f AUD\n   Volatility: %.4f%%\n   Score: %.2f",
-			i+1, coin.Code, coin.Name, coin.Symbol, coin.Volume, coin.Volatility, coin.Score)
+		coinInfo := fmt.Sprintf("%d. %s (%s)\n   Symbol: %s\n   Volume: %.2f AUD\n   Volatility: %.4f%%\n   Spread: %.4f%%\n   Score: %.2f",
+			i+1, coin.Code, coin.Name, coin.Symbol, coin.Volume, coin.Volatility, coin.Spread, coin.Score)
 		t.Log(coinInfo)
 		fmt.Printf("%d. %s (%s)\n", i+1, coin.Code, coin.Name)
 		fmt.Printf("   Symbol: %s\n", coin.Symbol)
 		fmt.Printf("   Volume: %.2f AUD\n", coin.Volume)
 		fmt.Printf("   Volatility: %.4f%%\n", coin.Volatility)
+		fmt.Printf("   Spread: %.4f%%\n", coin.Spread)
 		fmt.Printf("   Score: %.2f\n", coin.Score)
 		fmt.Println()
 	}
