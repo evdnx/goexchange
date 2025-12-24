@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -123,16 +124,28 @@ const (
 
 const binanceHTTPTimeout = 10 * time.Second
 
-// NewBinanceClient creates a new Binance client for spot and futures trading
+// NewBinanceClient creates a new Binance client for spot and futures trading.
+// If apiKey or apiSecret are empty strings, they will be read from environment variables
+// BINANCE_API_KEY and BINANCE_API_SECRET respectively.
 func NewBinanceClient(apiKey, apiSecret string, testnet bool, metrics *metrics.Metrics) *BinanceClient {
+	// Read from environment variables if not provided
+	if apiKey == "" {
+		apiKey = os.Getenv("BINANCE_API_KEY")
+	}
+	if apiSecret == "" {
+		apiSecret = os.Getenv("BINANCE_API_SECRET")
+	}
+
 	baseURL := "https://api.binance.com"
 	futuresBaseURL := "https://fapi.binance.com"
 	wsURL := "wss://stream.binance.com:9443"
 
 	if testnet {
-		baseURL = "https://testnet.binance.vision"
-		futuresBaseURL = "https://testnet.binancefuture.com"
-		wsURL = "wss://testnet.binance.vision"
+		// For demo accounts, use demo-api.binance.com
+		// Note: Demo environment may not support all endpoints (e.g., /order/test)
+		baseURL = "https://demo-api.binance.com/api"
+		futuresBaseURL = "https://testnet.binancefuture.com" // Prepend "/fapi" for USDT-M or "/dapi" for Coin-M in endpoints, e.g., futuresBaseURL + "/fapi/v1/ticker/price"
+		wsURL = "wss://demo-api.binance.com"                 // Append "/ws" for user data or "/stream" for market data/combined streams, e.g., wsURL + "/ws" or wsURL + "/stream?streams=..."
 	}
 
 	client := &BinanceClient{
@@ -175,12 +188,48 @@ func (c *BinanceClient) getHeaders() map[string]string {
 	}
 }
 
-// addSignature adds timestamp and HMAC SHA256 signature to request parameters
+// addSignature adds timestamp, recvWindow, and HMAC SHA256 signature to request parameters.
+// Uses the default recvWindow of 5000 milliseconds.
 func (c *BinanceClient) addSignature(params url.Values) url.Values {
+	return c.addSignatureWithRecvWindow(params, 5000)
+}
+
+// addSignatureWithRecvWindow adds timestamp, recvWindow, and HMAC SHA256 signature to request parameters.
+//
+// According to Binance API documentation (https://developers.binance.com/docs/binance-spot-api-docs/testnet/rest-api/request-security):
+//   - timestamp: Current timestamp in milliseconds (or microseconds)
+//   - recvWindow: Optional receive window in milliseconds (default: 5000, max: 60000)
+//     Supports up to 3 decimal places of precision (e.g., 6000.346) for microsecond precision
+//   - signature: HMAC SHA256 signature of the payload
+//
+// Signature computation:
+//   - For GET/DELETE requests: signature payload = query string (all parameters URL-encoded)
+//   - For POST requests: signature payload = query string + HTTP body (concatenated without separator)
+//     Note: Current implementation sends all params in body, so signature = encoded body content
+//
+// Important:
+// - Non-ASCII characters must be percent-encoded before signing (handled by url.Values.Encode())
+// - HMAC signatures are case-insensitive (RSA and Ed25519 are case-sensitive)
+// - Signature is computed from params WITHOUT the signature field, then added to params
+func (c *BinanceClient) addSignatureWithRecvWindow(params url.Values, recvWindow int) url.Values {
+	// Add timestamp in milliseconds
 	timestamp := fmt.Sprintf("%d", time.Now().UnixNano()/int64(time.Millisecond))
 	params.Add("timestamp", timestamp)
+
+	// Add recvWindow if specified (defaults to 5000ms if not provided)
+	// recvWindow supports up to 3 decimal places for microsecond precision
+	if recvWindow > 0 {
+		params.Add("recvWindow", strconv.Itoa(recvWindow))
+	}
+
+	// Encode params to create the signature payload
+	// url.Values.Encode() handles percent-encoding of non-ASCII characters
 	payload := params.Encode()
+
+	// Compute HMAC SHA256 signature (case-insensitive for HMAC)
 	signature := createHMACSHA256Signature(payload, c.APISecret())
+
+	// Add signature to params (will be included in final request)
 	params.Add("signature", signature)
 	return params
 }
@@ -249,11 +298,28 @@ func headerOptions(headers map[string]string) []gohttpcl.ReqOption {
 	return options
 }
 
-// createHMACSHA256Signature generates an HMAC SHA256 signature
+// createHMACSHA256Signature generates an HMAC SHA256 signature.
+// According to Binance API documentation, HMAC signatures are case-insensitive
+// (unlike RSA and Ed25519 signatures which are case-sensitive).
+// Returns the signature as a hexadecimal string.
 func createHMACSHA256Signature(payload, secret string) string {
 	h := hmac.New(sha256.New, []byte(secret))
 	h.Write([]byte(payload))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// apiPath constructs the API path correctly based on whether baseURL already includes "/api"
+func (c *BinanceClient) apiPath(version string) string {
+	return constructAPIPath(c.baseURL, version)
+}
+
+// constructAPIPath is a helper function that constructs the API path correctly
+// based on whether baseURL already includes "/api"
+func constructAPIPath(baseURL, version string) string {
+	if strings.HasSuffix(baseURL, "/api") {
+		return fmt.Sprintf("%s/%s", baseURL, version)
+	}
+	return fmt.Sprintf("%s/api/%s", baseURL, version)
 }
 
 // convertToBinanceSymbol converts symbol format (e.g., "BTC/USDT" to "BTCUSDT")
@@ -276,7 +342,7 @@ func convertFromBinanceSymbol(binanceSymbol string) string {
 // FetchMarketData fetches latest market data for a symbol
 func (c *BinanceClient) FetchMarketData(symbol string) (models.MarketData, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/klines", c.baseURL)
+	endpoint := fmt.Sprintf("%s/klines", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 	params.Add("interval", "1m")
@@ -354,7 +420,7 @@ func (c *BinanceClient) FetchMarketData(symbol string) (models.MarketData, error
 // GetTicker returns ticker information for a symbol
 func (c *BinanceClient) GetTicker(symbol string) (*models.Ticker, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/ticker/24hr", c.baseURL)
+	endpoint := fmt.Sprintf("%s/ticker/24hr", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 
@@ -400,7 +466,7 @@ func (c *BinanceClient) GetTicker(symbol string) (*models.Ticker, error) {
 // GetCandles returns candlestick data for a symbol
 func (c *BinanceClient) GetCandles(symbol, interval string, since time.Time, limit int) ([]models.Candle, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/klines", c.baseURL)
+	endpoint := fmt.Sprintf("%s/klines", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 	params.Add("interval", interval)
@@ -505,7 +571,7 @@ func (c *BinanceClient) GetCandles(symbol, interval string, since time.Time, lim
 // GetTrades returns trade history for a symbol
 func (c *BinanceClient) GetTrades(symbol string, since time.Time, limit int) ([]models.Trade, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/trades", c.baseURL)
+	endpoint := fmt.Sprintf("%s/trades", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 	params.Add("limit", strconv.Itoa(limit))
@@ -554,7 +620,7 @@ func (c *BinanceClient) GetTrades(symbol string, since time.Time, limit int) ([]
 // Binance supports depths: 5, 10, 20, 50, 100, 500, 1000, 5000
 func (c *BinanceClient) GetOrderBook(symbol string, depth int) (*models.OrderBook, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/depth", c.baseURL)
+	endpoint := fmt.Sprintf("%s/depth", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 
@@ -625,34 +691,98 @@ func (c *BinanceClient) GetOrderBook(symbol string, depth int) (*models.OrderBoo
 	return orderBook, nil
 }
 
-// CreateOrder places a spot market order
+// CreateOrder places a spot market order.
+// Use test=true to validate the order without placing it (uses /api/v3/order/test endpoint).
+// recvWindow specifies the receive window in milliseconds (default: 5000).
 func (c *BinanceClient) CreateOrder(symbol string, side common.OrderSide, orderType common.OrderType, amount, price float64) (*common.Order, error) {
+	return c.CreateOrderWithOptions(symbol, side, orderType, amount, price, "", false, 5000)
+}
+
+// CreateOrderWithOptions places a spot market order with additional options.
+// test: if true, uses /api/v3/order/test endpoint to validate without placing a real order.
+// clientOrderID: optional custom client order ID (newClientOrderId parameter).
+// recvWindow: receive window in milliseconds (default: 5000, set to 0 to use default, max 60000).
+func (c *BinanceClient) CreateOrderWithOptions(symbol string, side common.OrderSide, orderType common.OrderType, amount, price float64, clientOrderID string, test bool, recvWindow int) (*common.Order, error) {
+	return c.CreateOrderAdvanced(symbol, side, orderType, amount, price, 0, clientOrderID, test, recvWindow)
+}
+
+// CreateOrderAdvanced places a spot market order with full control over all parameters.
+// For MARKET buy orders, you can use quoteOrderQty instead of quantity to specify
+// how much quote currency to spend (e.g., buy $100 worth of BTC).
+// Parameters:
+//   - symbol: trading pair (e.g., "BTC/USDT")
+//   - side: BUY or SELL
+//   - orderType: MARKET or LIMIT
+//   - amount: quantity of base asset (ignored if quoteOrderQty > 0 for MARKET buy)
+//   - price: limit price (required for LIMIT orders, ignored for MARKET orders)
+//   - quoteOrderQty: quote quantity for MARKET buy orders (e.g., 100.0 to buy $100 worth)
+//   - clientOrderID: optional custom client order ID
+//   - test: if true, uses /api/v3/order/test endpoint to validate without placing a real order
+//   - recvWindow: receive window in milliseconds (default: 5000, max: 60000)
+func (c *BinanceClient) CreateOrderAdvanced(symbol string, side common.OrderSide, orderType common.OrderType, amount, price, quoteOrderQty float64, clientOrderID string, test bool, recvWindow int) (*common.Order, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/order", c.baseURL)
+	endpointPath := "order"
+	if test {
+		endpointPath = "order/test"
+	}
+	endpoint := fmt.Sprintf("%s/%s", c.apiPath("v3"), endpointPath)
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 	params.Add("side", strings.ToUpper(side.String()))
 	params.Add("type", strings.ToUpper(orderType.String()))
 
+	// For LIMIT orders, timeInForce is required
 	if strings.EqualFold(orderType.String(), common.OrderTypeLimit.String()) {
 		params.Add("timeInForce", string(common.TimeInForceGTC))
-	}
-
-	quantity := amount
-	if quantity <= 0 {
-		return nil, fmt.Errorf("order quantity must be greater than 0")
-	}
-	params.Add("quantity", strconv.FormatFloat(quantity, 'f', -1, 64))
-
-	if price > 0 {
+		if price <= 0 {
+			return nil, fmt.Errorf("price is required for limit orders")
+		}
 		params.Add("price", strconv.FormatFloat(price, 'f', -1, 64))
 	}
 
-	params = c.addSignature(params)
+	// For MARKET orders:
+	// - BUY: can use either quantity (base asset) or quoteOrderQty (quote currency)
+	// - SELL: must use quantity (base asset)
+	isMarketBuy := strings.EqualFold(orderType.String(), common.OrderTypeMarket.String()) && side == common.OrderSideBuy
+
+	if isMarketBuy && quoteOrderQty > 0 {
+		// Market buy with fixed quote amount (e.g., buy $100 worth of BTC)
+		params.Add("quoteOrderQty", strconv.FormatFloat(quoteOrderQty, 'f', -1, 64))
+	} else {
+		// Use quantity (base asset amount)
+		quantity := amount
+		if quantity <= 0 {
+			return nil, fmt.Errorf("order quantity must be greater than 0")
+		}
+		params.Add("quantity", strconv.FormatFloat(quantity, 'f', -1, 64))
+	}
+
+	// Add custom client order ID if provided
+	if clientOrderID != "" {
+		params.Add("newClientOrderId", clientOrderID)
+	}
+
+	// Validate and set recvWindow (default: 5000, max: 60000)
+	if recvWindow <= 0 {
+		recvWindow = 5000
+	} else if recvWindow > 60000 {
+		recvWindow = 60000
+	}
+	params = c.addSignatureWithRecvWindow(params, recvWindow)
 	response, err := c.doPost(endpoint, []byte(params.Encode()), map[string]string{
 		"Content-Type": "application/x-www-form-urlencoded",
 	})
 	if err != nil {
+		// Check if this is a 404 error on the test endpoint
+		if test {
+			var httpErr *common.ExchangeError
+			if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+				return nil, fmt.Errorf("the /order/test endpoint is not available in the demo environment. "+
+					"Demo accounts may not support order validation. "+
+					"Try using test=false to place an actual order in the demo account, "+
+					"or use testnet.binance.vision for full test endpoint support. Original error: %w", err)
+			}
+		}
 		return nil, fmt.Errorf("failed to place order: %w", err)
 	}
 
@@ -679,6 +809,61 @@ func (c *BinanceClient) CreateOrder(symbol string, side common.OrderSide, orderT
 
 	if orderResponse.Code != 0 {
 		return nil, fmt.Errorf("order error: %s", orderResponse.Message)
+	}
+
+	// For test orders, don't try to fetch the order since it doesn't actually exist
+	// The test endpoint only validates the order parameters
+	if test {
+		// Test endpoint may return minimal data, so construct order from what we have
+		// Use a default status if not provided
+		statusStr := orderResponse.Status
+		if statusStr == "" {
+			statusStr = "NEW" // Default status for test orders
+		}
+		status, err := binanceStatusToCommon(statusStr)
+		if err != nil {
+			// If status conversion fails, use NEW as default
+			status = common.OrderStatusNew
+		}
+
+		orderPrice, _ := strconv.ParseFloat(orderResponse.Price, 64)
+		orderAmount, _ := strconv.ParseFloat(orderResponse.OrigQty, 64)
+		filled, _ := strconv.ParseFloat(orderResponse.ExecutedQty, 64)
+		symbolFormatted := symbol
+		if orderResponse.Symbol != "" {
+			symbolFormatted = convertFromBinanceSymbol(orderResponse.Symbol)
+		}
+
+		orderTime := orderResponse.Time
+		if orderTime == 0 {
+			orderTime = time.Now().UnixNano() / int64(time.Millisecond)
+		}
+		updateTime := orderResponse.UpdateTime
+		if updateTime == 0 {
+			updateTime = orderTime
+		}
+
+		orderID := ""
+		if orderResponse.OrderID > 0 {
+			orderID = strconv.FormatInt(orderResponse.OrderID, 10)
+		}
+
+		return &common.Order{
+			ID:              orderID,
+			ClientOrderID:   orderResponse.ClientOrderID,
+			Symbol:          symbolFormatted,
+			Side:            side,
+			Type:            orderType,
+			Status:          status,
+			Price:           orderPrice,
+			Amount:          orderAmount,
+			FilledAmount:    filled,
+			RemainingAmount: orderAmount - filled,
+			CreatedAt:       time.Unix(orderTime/1000, 0),
+			UpdatedAt:       time.Unix(updateTime/1000, 0),
+			Quantity:        orderAmount,
+			Timestamp:       time.Unix(orderTime/1000, 0),
+		}, nil
 	}
 
 	// If the response doesn't have all fields, fetch the complete order
@@ -832,7 +1017,7 @@ func (c *BinanceClient) GetOrder(symbol, orderID string) (*common.Order, error) 
 	if strings.TrimSpace(orderID) == "" {
 		return nil, fmt.Errorf("orderID is required to query an order")
 	}
-	endpoint := fmt.Sprintf("%s/api/v3/order", c.baseURL)
+	endpoint := fmt.Sprintf("%s/order", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", convertToBinanceSymbol(symbol))
 	params.Add("orderId", orderID)
@@ -922,7 +1107,7 @@ func (c *BinanceClient) GetBalance(asset string) (*common.Balance, error) {
 
 // GetBalances returns all account balances
 func (c *BinanceClient) GetBalances() (map[string]*common.Balance, error) {
-	endpoint := fmt.Sprintf("%s/api/v3/account", c.baseURL)
+	endpoint := fmt.Sprintf("%s/account", c.apiPath("v3"))
 	params := url.Values{}
 	params = c.addSignature(params)
 
@@ -955,7 +1140,7 @@ func (c *BinanceClient) GetBalances() (map[string]*common.Balance, error) {
 // GetOpenOrders retrieves all open orders for a symbol
 func (c *BinanceClient) GetOpenOrders(symbol string) ([]common.Order, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/openOrders", c.baseURL)
+	endpoint := fmt.Sprintf("%s/openOrders", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 	params = c.addSignature(params)
@@ -1003,7 +1188,7 @@ func (c *BinanceClient) GetOpenOrders(symbol string) ([]common.Order, error) {
 // GetOrders retrieves order history for a symbol
 func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]common.Order, error) {
 	binanceSymbol := convertToBinanceSymbol(symbol)
-	endpoint := fmt.Sprintf("%s/api/v3/allOrders", c.baseURL)
+	endpoint := fmt.Sprintf("%s/allOrders", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
 
@@ -1064,7 +1249,7 @@ func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]
 
 // GetTradingPairs returns all available trading pairs
 func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
-	endpoint := fmt.Sprintf("%s/api/v3/exchangeInfo", c.baseURL)
+	endpoint := fmt.Sprintf("%s/exchangeInfo", c.apiPath("v3"))
 	response, err := c.doGet(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch exchange info: %w", err)
@@ -1978,7 +2163,7 @@ func (c *BinanceClient) CancelAllOrders(symbol string) error {
 	binanceSymbol := convertToBinanceSymbol(symbol)
 
 	// Construct the API URL
-	endpoint := fmt.Sprintf("%s/api/v3/openOrders", c.baseURL)
+	endpoint := fmt.Sprintf("%s/openOrders", c.apiPath("v3"))
 
 	// Prepare the request parameters
 	params := url.Values{}
@@ -2501,7 +2686,7 @@ func (c *BinanceWebSocketClient) getListenKey() (string, error) {
 
 	// Use spot API endpoint for user data stream
 	// For futures, this would be /fapi/v1/listenKey, but we'll use spot for now
-	endpoint := fmt.Sprintf("%s/api/v3/userDataStream", c.restBaseURL)
+	endpoint := fmt.Sprintf("%s/userDataStream", constructAPIPath(c.restBaseURL, "v3"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -2562,7 +2747,7 @@ func (c *BinanceWebSocketClient) keepAliveListenKey(listenKey string) error {
 		return fmt.Errorf("listen key required")
 	}
 
-	endpoint := fmt.Sprintf("%s/api/v3/userDataStream?listenKey=%s", c.restBaseURL, url.QueryEscape(listenKey))
+	endpoint := fmt.Sprintf("%s/userDataStream?listenKey=%s", constructAPIPath(c.restBaseURL, "v3"), url.QueryEscape(listenKey))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -2608,7 +2793,7 @@ func (c *BinanceWebSocketClient) closeListenKey(listenKey string) error {
 		return fmt.Errorf("listen key required")
 	}
 
-	endpoint := fmt.Sprintf("%s/api/v3/userDataStream?listenKey=%s", c.restBaseURL, url.QueryEscape(listenKey))
+	endpoint := fmt.Sprintf("%s/userDataStream?listenKey=%s", constructAPIPath(c.restBaseURL, "v3"), url.QueryEscape(listenKey))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
