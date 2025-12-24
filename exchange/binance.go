@@ -625,30 +625,27 @@ func (c *BinanceClient) GetOrderBook(symbol string, depth int) (*models.OrderBoo
 	return orderBook, nil
 }
 
-// PlaceOrder places a spot market order
-func (c *BinanceClient) PlaceOrder(order common.Order) (string, error) {
-	binanceSymbol := convertToBinanceSymbol(order.Symbol)
+// CreateOrder places a spot market order
+func (c *BinanceClient) CreateOrder(symbol string, side common.OrderSide, orderType common.OrderType, amount, price float64) (*common.Order, error) {
+	binanceSymbol := convertToBinanceSymbol(symbol)
 	endpoint := fmt.Sprintf("%s/api/v3/order", c.baseURL)
 	params := url.Values{}
 	params.Add("symbol", binanceSymbol)
-	params.Add("side", strings.ToUpper(order.Side.String()))
-	params.Add("type", strings.ToUpper(order.Type.String()))
+	params.Add("side", strings.ToUpper(side.String()))
+	params.Add("type", strings.ToUpper(orderType.String()))
 
-	if strings.EqualFold(order.Type.String(), common.OrderTypeLimit.String()) {
+	if strings.EqualFold(orderType.String(), common.OrderTypeLimit.String()) {
 		params.Add("timeInForce", string(common.TimeInForceGTC))
 	}
 
-	quantity := order.Amount
-	if quantity == 0 {
-		quantity = order.Quantity
-	}
+	quantity := amount
 	if quantity <= 0 {
-		return "", fmt.Errorf("order quantity must be greater than 0")
+		return nil, fmt.Errorf("order quantity must be greater than 0")
 	}
 	params.Add("quantity", strconv.FormatFloat(quantity, 'f', -1, 64))
 
-	if order.Price > 0 {
-		params.Add("price", strconv.FormatFloat(order.Price, 'f', -1, 64))
+	if price > 0 {
+		params.Add("price", strconv.FormatFloat(price, 'f', -1, 64))
 	}
 
 	params = c.addSignature(params)
@@ -656,23 +653,78 @@ func (c *BinanceClient) PlaceOrder(order common.Order) (string, error) {
 		"Content-Type": "application/x-www-form-urlencoded",
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to place order: %w", err)
+		return nil, fmt.Errorf("failed to place order: %w", err)
 	}
 
 	var orderResponse struct {
-		OrderID int64 `json:"orderId"`
+		Symbol                  string `json:"symbol"`
+		OrderID                 int64  `json:"orderId"`
+		ClientOrderID           string `json:"clientOrderId"`
+		Price                   string `json:"price"`
+		OrigQty                 string `json:"origQty"`
+		ExecutedQty             string `json:"executedQty"`
+		CumulativeQuoteQuantity string `json:"cummulativeQuoteQty"`
+		Status                  string `json:"status"`
+		TimeInForce             string `json:"timeInForce"`
+		Type                    string `json:"type"`
+		Side                    string `json:"side"`
+		Time                    int64  `json:"transactTime"`
+		UpdateTime              int64  `json:"updateTime"`
 		BinanceResponse
 	}
 
 	if err := json.Unmarshal(response, &orderResponse); err != nil {
-		return "", fmt.Errorf("failed to parse order response: %w", err)
+		return nil, fmt.Errorf("failed to parse order response: %w", err)
 	}
 
 	if orderResponse.Code != 0 {
-		return "", fmt.Errorf("order error: %s", orderResponse.Message)
+		return nil, fmt.Errorf("order error: %s", orderResponse.Message)
 	}
 
-	return strconv.FormatInt(orderResponse.OrderID, 10), nil
+	// If the response doesn't have all fields, fetch the complete order
+	if orderResponse.Status == "" {
+		orderID := strconv.FormatInt(orderResponse.OrderID, 10)
+		return c.GetOrder(symbol, orderID)
+	}
+
+	status, err := binanceStatusToCommon(orderResponse.Status)
+	if err != nil {
+		return nil, err
+	}
+
+	orderPrice, _ := strconv.ParseFloat(orderResponse.Price, 64)
+	orderAmount, _ := strconv.ParseFloat(orderResponse.OrigQty, 64)
+	filled, _ := strconv.ParseFloat(orderResponse.ExecutedQty, 64)
+	symbolFormatted := symbol
+	if orderResponse.Symbol != "" {
+		symbolFormatted = convertFromBinanceSymbol(orderResponse.Symbol)
+	}
+
+	orderTime := orderResponse.Time
+	if orderTime == 0 {
+		orderTime = time.Now().UnixNano() / int64(time.Millisecond)
+	}
+	updateTime := orderResponse.UpdateTime
+	if updateTime == 0 {
+		updateTime = orderTime
+	}
+
+	return &common.Order{
+		ID:              strconv.FormatInt(orderResponse.OrderID, 10),
+		ClientOrderID:   orderResponse.ClientOrderID,
+		Symbol:          symbolFormatted,
+		Side:            side,
+		Type:            orderType,
+		Status:          status,
+		Price:           orderPrice,
+		Amount:          orderAmount,
+		FilledAmount:    filled,
+		RemainingAmount: orderAmount - filled,
+		CreatedAt:       time.Unix(orderTime/1000, 0),
+		UpdatedAt:       time.Unix(updateTime/1000, 0),
+		Quantity:        orderAmount,
+		Timestamp:       time.Unix(orderTime/1000, 0),
+	}, nil
 }
 
 // PlaceFuturesOrder places a futures order
