@@ -1264,11 +1264,13 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 
 	var exchangeInfo struct {
 		Symbols []struct {
-			Symbol     string   `json:"symbol"`
-			Status     string   `json:"status"`
-			BaseAsset  string   `json:"baseAsset"`
-			QuoteAsset string   `json:"quoteAsset"`
-			Tags       []string `json:"tags,omitempty"`
+			Symbol     string `json:"symbol"`
+			Status     string `json:"status"`
+			BaseAsset  string `json:"baseAsset"`
+			QuoteAsset string `json:"quoteAsset"`
+			Tags       []struct {
+				Name string `json:"name"`
+			} `json:"tags,omitempty"`
 		} `json:"symbols"`
 		BinanceResponse
 	}
@@ -1286,7 +1288,7 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 		// Filter out tokens with Monitoring tag (not suitable for trading)
 		hasMonitoringTag := false
 		for _, tag := range symbol.Tags {
-			if strings.EqualFold(tag, "Monitoring") {
+			if strings.EqualFold(tag.Name, "Monitoring") {
 				hasMonitoringTag = true
 				break
 			}
@@ -1299,7 +1301,7 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 		if filterSeedTokens {
 			hasSeedTag := false
 			for _, tag := range symbol.Tags {
-				if strings.EqualFold(tag, "Seed") {
+				if strings.EqualFold(tag.Name, "Seed") {
 					hasSeedTag = true
 					break
 				}
