@@ -1253,6 +1253,7 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 }
 
 // GetTradingPairsWithFilter returns trading pairs with optional filtering of Seed tokens.
+// Always excludes tokens marked with "Monitoring" tag (tokens under observation, not suitable for trading).
 // filterSeedTokens: if true, excludes tokens marked with "Seed" tag (high-risk tokens with potential total loss).
 func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]common.TradingPair, error) {
 	endpoint := fmt.Sprintf("%s/exchangeInfo", c.apiPath("v3"))
@@ -1279,6 +1280,18 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 	var tradingPairs []common.TradingPair
 	for _, symbol := range exchangeInfo.Symbols {
 		if symbol.Status != "TRADING" {
+			continue
+		}
+
+		// Filter out tokens with Monitoring tag (not suitable for trading)
+		hasMonitoringTag := false
+		for _, tag := range symbol.Tags {
+			if strings.EqualFold(tag, "Monitoring") {
+				hasMonitoringTag = true
+				break
+			}
+		}
+		if hasMonitoringTag {
 			continue
 		}
 
