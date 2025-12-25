@@ -1284,6 +1284,7 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
+// OPTIMIZED VERSION: Uses batch ticker fetching, parallel processing, and two-phase analysis.
 // It uses an advanced multi-factor scoring algorithm that considers:
 //   - Volume: 24h trading volume (normalized, log scale)
 //   - Volatility: Daily price volatility from 1-minute candles (standard deviation of log returns)
@@ -1305,8 +1306,8 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 // The algorithm prioritizes coins with high volume, good volatility, deep order books, tight spreads, and low slippage risk.
 func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration, maxSpread float64) ([]ScalpingCoin, error) {
 	// Use a timeout context to prevent indefinite hanging
-	// Default timeout: 30 minutes (enough for analyzing many assets with rate limiting)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	// Default timeout: 5 minutes (optimized version should be much faster)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Default values
@@ -1320,13 +1321,14 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 		topN = 10
 	}
 	if rateLimitDelay <= 0 {
-		rateLimitDelay = 100 * time.Millisecond // Binance allows faster rate limits than Swyftx
+		rateLimitDelay = 100 * time.Millisecond
 	}
 	if maxSpread <= 0 {
-		maxSpread = 0.5 // Default: 0.5% maximum spread (tighter than Swyftx for better scalping)
+		maxSpread = 0.5 // Default: 0.5% maximum spread
 	}
 
 	quoteAsset = strings.ToUpper(quoteAsset)
+	logger := common.DefaultLogger()
 
 	// Get all trading pairs
 	tradingPairs, err := c.GetTradingPairs()
@@ -1334,11 +1336,14 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 		return nil, fmt.Errorf("failed to get trading pairs: %w", err)
 	}
 
-	// Filter pairs by quote asset
-	var candidatePairs []common.TradingPair
+	// Filter pairs by quote asset and build symbol map
+	candidatePairs := make([]common.TradingPair, 0)
+	symbolMap := make(map[string]common.TradingPair) // binanceSymbol -> TradingPair
 	for _, pair := range tradingPairs {
 		if strings.EqualFold(pair.QuoteAsset, quoteAsset) {
 			candidatePairs = append(candidatePairs, pair)
+			binanceSymbol := convertToBinanceSymbol(pair.Symbol)
+			symbolMap[binanceSymbol] = pair
 		}
 	}
 
@@ -1346,205 +1351,206 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 		return nil, fmt.Errorf("no trading pairs found for quote asset %s", quoteAsset)
 	}
 
-	// Analyze each pair
-	var rankedCoins []ScalpingCoin
-	var allAnalyzedCoins []ScalpingCoin // Track all coins for fallback
-	since := time.Now().Add(-24 * time.Hour)
+	// PHASE 1: Batch fetch all 24h tickers in one API call (major optimization)
+	allTickers, err := c.getAllTickers24hr(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch all tickers: %w", err)
+	}
 
-	// Debug counters
-	var tickersFetched, candlesFetched, candlesInsufficient, volumeFiltered, volatilityFiltered, spreadFiltered, orderBooksFetched int
+	// Filter and score candidates using ticker data only
+	type candidateData struct {
+		pair        common.TradingPair
+		volume      float64
+		spread      float64
+		priceChange float64 // Use as volatility proxy
+		lastPrice   float64
+		bidPrice    float64
+		askPrice    float64
+		score       float64 // Preliminary score
+	}
 
-	var firstError error
-	var errorCount int
-	logger := common.DefaultLogger()
+	candidates := make([]candidateData, 0)
+	var volumeFiltered, spreadFiltered int
 
-	for i, pair := range candidatePairs {
-		// Check context cancellation before processing each pair
-		select {
-		case <-ctx.Done():
-			// Return partial results if context is cancelled
-			if len(rankedCoins) > 0 {
-				sort.Slice(rankedCoins, func(i, j int) bool {
-					return rankedCoins[i].Score > rankedCoins[j].Score
-				})
-				if len(rankedCoins) > topN {
-					rankedCoins = rankedCoins[:topN]
-				}
-				return rankedCoins, fmt.Errorf("context cancelled: %w", ctx.Err())
-			}
-			return nil, fmt.Errorf("context cancelled: %w", ctx.Err())
-		default:
+	for _, ticker := range allTickers {
+		pair, exists := symbolMap[ticker.Symbol]
+		if !exists {
+			continue // Not a candidate pair
 		}
 
-		// Rate limiting: add delay between requests (except for the first one)
-		if i > 0 {
-			// Use context-aware sleep that respects cancellation
-			select {
-			case <-ctx.Done():
-				return nil, fmt.Errorf("context cancelled during rate limiting: %w", ctx.Err())
-			case <-time.After(rateLimitDelay):
-				// Continue after delay
-			}
-		}
+		// Parse ticker values
+		volume := ticker.parseVolume()
+		lastPrice := ticker.parseLastPrice()
+		bidPrice := ticker.parseBidPrice()
+		askPrice := ticker.parseAskPrice()
+		priceChangePercent := ticker.parsePriceChangePercent()
 
-		symbol := pair.Symbol
-
-		// Fetch 24h ticker first (more efficient - already has volume and bid/ask)
-		ticker, err := c.GetTicker(symbol)
-		if err != nil {
-			// Track first error for debugging
-			if firstError == nil {
-				firstError = err
-			}
-			errorCount++
-			// Log first few errors for debugging
-			if errorCount <= 3 {
-				logger.Debugf("GetTicker failed for %s: %v", symbol, err)
-			}
-			// Skip pairs that fail to fetch ticker
-			continue
-		}
-		tickersFetched++
-
-		// Get volume from ticker (24h volume in quote currency)
-		totalVolume := ticker.Volume
-
-		// Filter by minimum volume early (before expensive candle fetch)
-		if totalVolume < minVolume {
+		// Filter by minimum volume
+		if volume < minVolume {
 			volumeFiltered++
 			continue
 		}
 
-		// Calculate spread from ticker
+		// Calculate spread
 		var spread float64
-		if ticker.Bid > 0 && ticker.Ask > 0 && ticker.Ask >= ticker.Bid {
-			midPrice := (ticker.Bid + ticker.Ask) / 2
+		if bidPrice > 0 && askPrice > 0 && askPrice >= bidPrice {
+			midPrice := (bidPrice + askPrice) / 2
 			if midPrice > 0 {
-				spread = ((ticker.Ask - ticker.Bid) / midPrice) * 100
+				spread = ((askPrice - bidPrice) / midPrice) * 100
 			}
 		}
 
-		// Filter by maximum spread early (before expensive candle fetch)
+		// Filter by maximum spread
 		if spread > maxSpread {
 			spreadFiltered++
 			continue
 		}
 
-		// Fetch 24h of 1-minute candles for volatility calculation (1440 candles = 24 hours)
-		candles, err := c.GetCandles(symbol, "1m", since, 1440)
-		if err != nil {
-			// Track first error for debugging
-			if firstError == nil {
-				firstError = err
-			}
-			errorCount++
-			// Log first few errors for debugging
-			if errorCount <= 3 {
-				logger.Debugf("GetCandles failed for %s: %v", symbol, err)
-			}
-			// Skip pairs that fail to fetch candles
-			continue
-		}
-		candlesFetched++
-
-		if len(candles) < 2 {
-			candlesInsufficient++
-			continue
+		// Use priceChangePercent as volatility proxy (absolute value)
+		volatilityProxy := math.Abs(priceChangePercent)
+		if volatilityProxy <= 0 {
+			continue // Skip coins with no price movement
 		}
 
-		// Calculate volatility from close prices
-		volatility := calculateBinanceVolatility(candles)
+		// Preliminary score using ticker data only (without order book)
+		// This allows us to rank and only fetch expensive data for top candidates
+		preliminaryScore := calculateScalpingScore(volume, volatilityProxy, 1.0, 1.0, spread, 1.0)
 
-		// Filter by volatility
-		if volatility <= 0 {
+		candidates = append(candidates, candidateData{
+			pair:        pair,
+			volume:      volume,
+			spread:      spread,
+			priceChange: volatilityProxy,
+			lastPrice:   lastPrice,
+			bidPrice:    bidPrice,
+			askPrice:    askPrice,
+			score:       preliminaryScore,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no candidates passed initial filters: volumeFiltered=%d, spreadFiltered=%d", volumeFiltered, spreadFiltered)
+	}
+
+	// Sort by preliminary score and take top candidates for detailed analysis
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+
+	// Only analyze top 2*topN candidates in detail (to account for order book filtering)
+	detailedCandidates := candidates
+	if len(candidates) > topN*2 {
+		detailedCandidates = candidates[:topN*2]
+	}
+
+	// PHASE 2: Parallel fetch detailed data (candles and order books) for top candidates
+	type detailedResult struct {
+		coin       ScalpingCoin
+		err        error
+		hasDetails bool
+	}
+
+	resultChan := make(chan detailedResult, len(detailedCandidates))
+	semaphore := make(chan struct{}, 10) // Limit concurrent requests to 10
+
+	var wg sync.WaitGroup
+	since := time.Now().Add(-24 * time.Hour)
+
+	for _, cand := range detailedCandidates {
+		wg.Add(1)
+		go func(cand candidateData) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // Acquire semaphore
+			defer func() { <-semaphore }() // Release semaphore
+
+			symbol := cand.pair.Symbol
+
+			// Fetch candles for accurate volatility calculation
+			candles, err := c.GetCandles(symbol, "1m", since, 1440)
+			volatility := cand.priceChange // Default to price change if candles fail
+			if err == nil && len(candles) >= 2 {
+				volatility = calculateBinanceVolatility(candles)
+			}
+
+			if volatility <= 0 {
+				resultChan <- detailedResult{err: fmt.Errorf("invalid volatility")}
+				return
+			}
+
+			// Fetch order book for liquidity analysis
+			orderBook, err := c.GetOrderBook(symbol, 20)
+			liquidityScore, orderBookImbalance, priceImpactFactor := 1.0, 1.0, 1.0
+			hasOrderBook := false
+			if err == nil && orderBook != nil {
+				hasOrderBook = true
+				midPrice := cand.lastPrice
+				if midPrice <= 0 {
+					midPrice = (cand.bidPrice + cand.askPrice) / 2
+				}
+				if midPrice > 0 {
+					liquidityScore = calculateOrderBookLiquidity(orderBook, midPrice)
+					orderBookImbalance = calculateOrderBookImbalance(orderBook)
+					priceImpactFactor = calculatePriceImpactFactor(orderBook, midPrice)
+				}
+			}
+
+			// Calculate final score with all factors
+			finalScore := calculateScalpingScore(cand.volume, volatility, liquidityScore, orderBookImbalance, cand.spread, priceImpactFactor)
+
+			coin := ScalpingCoin{
+				Code:       cand.pair.BaseAsset,
+				Name:       cand.pair.BaseAsset,
+				Symbol:     symbol,
+				Volume:     cand.volume,
+				Volatility: volatility,
+				Spread:     cand.spread,
+				Score:      finalScore,
+			}
+
+			resultChan <- detailedResult{
+				coin:       coin,
+				hasDetails: hasOrderBook,
+			}
+		}(cand)
+	}
+
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	rankedCoins := make([]ScalpingCoin, 0)
+	var candlesFetched, orderBooksFetched, volatilityFiltered int
+
+	for result := range resultChan {
+		if result.err != nil {
+			continue
+		}
+		if result.coin.Volatility <= 0 {
 			volatilityFiltered++
 			continue
 		}
-
-		// Fetch order book for liquidity analysis (depth 20 is good for scalping)
-		// If order book fetch fails, use default values (no penalty, just no bonus)
-		orderBook, err := c.GetOrderBook(symbol, 20)
-		var liquidityScore, orderBookImbalance, priceImpactFactor float64 = 1.0, 1.0, 1.0
-		if err == nil && orderBook != nil {
+		if result.hasDetails {
 			orderBooksFetched++
-			midPrice := ticker.LastPrice
-			if midPrice <= 0 {
-				midPrice = (ticker.Bid + ticker.Ask) / 2
-			}
-			if midPrice > 0 {
-				// Calculate order book metrics
-				liquidityScore = calculateOrderBookLiquidity(orderBook, midPrice)
-				orderBookImbalance = calculateOrderBookImbalance(orderBook)
-				priceImpactFactor = calculatePriceImpactFactor(orderBook, midPrice)
-			}
 		}
-
-		// Enhanced scoring algorithm for scalping
-		// Factors:
-		// - Volume (normalized): Higher volume = better liquidity
-		// - Volatility (normalized): Need price movement to profit
-		// - Liquidity score: Deep order book = less slippage
-		// - Order book imbalance: Can indicate momentum (slight preference for balanced)
-		// Penalties:
-		// - Spread: Wide spreads eat profits
-		// - Price impact: Thin order books = high slippage risk
-		score := calculateScalpingScore(totalVolume, volatility, liquidityScore, orderBookImbalance, spread, priceImpactFactor)
-
-		// Create coin entry
-		coin := ScalpingCoin{
-			Code:       pair.BaseAsset,
-			Name:       pair.BaseAsset, // Binance doesn't provide asset names in trading pairs
-			Symbol:     symbol,
-			Volume:     totalVolume,
-			Volatility: volatility,
-			Spread:     spread,
-			Score:      score,
-		}
-
-		// Always track all analyzed coins for fallback
-		allAnalyzedCoins = append(allAnalyzedCoins, coin)
-
-		// Add to ranked coins if it meets all criteria
-		rankedCoins = append(rankedCoins, coin)
+		candlesFetched++
+		rankedCoins = append(rankedCoins, result.coin)
 	}
 
-	// Sort by score (descending)
+	// Sort by final score
 	sort.Slice(rankedCoins, func(i, j int) bool {
 		return rankedCoins[i].Score > rankedCoins[j].Score
 	})
 
 	// Debug logging
-	logger.Debugf("FindScalpingCoins: candidatePairs=%d, tickersFetched=%d, candlesFetched=%d, orderBooksFetched=%d, candlesInsufficient=%d, allAnalyzed=%d, volumeFiltered=%d, volatilityFiltered=%d, spreadFiltered=%d, ranked=%d",
-		len(candidatePairs), tickersFetched, candlesFetched, orderBooksFetched, candlesInsufficient, len(allAnalyzedCoins), volumeFiltered, volatilityFiltered, spreadFiltered, len(rankedCoins))
+	logger.Debugf("FindScalpingCoins (optimized): candidatePairs=%d, tickersBatch=1, candlesFetched=%d, orderBooksFetched=%d, volumeFiltered=%d, spreadFiltered=%d, volatilityFiltered=%d, ranked=%d",
+		len(candidatePairs), candlesFetched, orderBooksFetched, volumeFiltered, spreadFiltered, volatilityFiltered, len(rankedCoins))
 
-	// If no coins were analyzed at all, this indicates a problem
-	if len(allAnalyzedCoins) == 0 {
-		errMsg := fmt.Sprintf("no coins could be analyzed: candidatePairs=%d, tickersFetched=%d, candlesFetched=%d, candlesInsufficient=%d, errors=%d",
-			len(candidatePairs), tickersFetched, candlesFetched, candlesInsufficient, errorCount)
-		if firstError != nil {
-			errMsg += fmt.Sprintf(" - first error: %v", firstError)
-		}
-		return nil, fmt.Errorf("%s - check if GetTicker and GetCandles are working correctly", errMsg)
-	}
-
-	// If no coins meet the strict criteria, fall back to best available coin
-	if len(rankedCoins) == 0 && len(allAnalyzedCoins) > 0 {
-		// Sort all analyzed coins by volume (fallback to volume if no volatility)
-		sort.Slice(allAnalyzedCoins, func(i, j int) bool {
-			// Prefer coins with both volume and volatility, but fall back to volume
-			if allAnalyzedCoins[i].Volatility > 0 && allAnalyzedCoins[j].Volatility > 0 {
-				return allAnalyzedCoins[i].Score > allAnalyzedCoins[j].Score
-			}
-			if allAnalyzedCoins[i].Volatility > 0 {
-				return true
-			}
-			if allAnalyzedCoins[j].Volatility > 0 {
-				return false
-			}
-			return allAnalyzedCoins[i].Volume > allAnalyzedCoins[j].Volume
-		})
-		// Return at least the best coin
-		rankedCoins = []ScalpingCoin{allAnalyzedCoins[0]}
+	// If no coins meet criteria, return error
+	if len(rankedCoins) == 0 {
+		return nil, fmt.Errorf("no coins passed all filters after detailed analysis")
 	}
 
 	// Return top N
@@ -1553,6 +1559,71 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 	}
 
 	return rankedCoins, nil
+}
+
+// getAllTickers24hr fetches all 24h ticker statistics in one batch API call.
+// This is much more efficient than fetching individual tickers.
+func (c *BinanceClient) getAllTickers24hr(ctx context.Context) ([]binanceTicker24hr, error) {
+	endpoint := fmt.Sprintf("%s/ticker/24hr", c.apiPath("v3"))
+	// No symbol parameter = get all tickers
+
+	response, err := c.doRequest(ctx, http.MethodGet, endpoint, nil, c.getHeaders())
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch all tickers: %w", err)
+	}
+
+	var tickers []binanceTicker24hr
+	if err := json.Unmarshal(response, &tickers); err != nil {
+		return nil, fmt.Errorf("failed to parse tickers: %w", err)
+	}
+
+	return tickers, nil
+}
+
+// binanceTicker24hr represents the 24h ticker statistics from Binance API
+type binanceTicker24hr struct {
+	Symbol             string `json:"symbol"`
+	LastPrice          string `json:"lastPrice"`
+	Volume             string `json:"volume"`
+	QuoteVolume        string `json:"quoteVolume"` // Volume in quote currency
+	BidPrice           string `json:"bidPrice"`
+	AskPrice           string `json:"askPrice"`
+	PriceChangePercent string `json:"priceChangePercent"`
+	CloseTime          int64  `json:"closeTime"`
+}
+
+// parseVolume parses volume, preferring quoteVolume if available
+func (t *binanceTicker24hr) parseVolume() float64 {
+	quoteVol, _ := strconv.ParseFloat(t.QuoteVolume, 64)
+	if quoteVol > 0 {
+		return quoteVol
+	}
+	vol, _ := strconv.ParseFloat(t.Volume, 64)
+	return vol
+}
+
+// parseLastPrice parses last price
+func (t *binanceTicker24hr) parseLastPrice() float64 {
+	price, _ := strconv.ParseFloat(t.LastPrice, 64)
+	return price
+}
+
+// parseBidPrice parses bid price
+func (t *binanceTicker24hr) parseBidPrice() float64 {
+	price, _ := strconv.ParseFloat(t.BidPrice, 64)
+	return price
+}
+
+// parseAskPrice parses ask price
+func (t *binanceTicker24hr) parseAskPrice() float64 {
+	price, _ := strconv.ParseFloat(t.AskPrice, 64)
+	return price
+}
+
+// parsePriceChangePercent parses price change percent
+func (t *binanceTicker24hr) parsePriceChangePercent() float64 {
+	percent, _ := strconv.ParseFloat(t.PriceChangePercent, 64)
+	return percent
 }
 
 // calculateBinanceVolatility calculates the daily volatility as the standard deviation of log returns.
