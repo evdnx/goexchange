@@ -1,8 +1,11 @@
 package exchange
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	common "github.com/evdnx/goexchange/common"
 )
@@ -118,4 +121,160 @@ func TestBinanceCreateOrder_MarketBuy_DUSDT(t *testing.T) {
 	if order.Price > 0 {
 		t.Logf("  Price: %f", order.Price)
 	}
+}
+
+// TestBinanceFindScalpingCoins tests getting scalping coins from Binance
+// and logs the full API response from exchangeInfo endpoint where tag data is located.
+func TestBinanceFindScalpingCoins(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Binance call in short mode")
+	}
+
+	// Create Binance client (no API keys needed for public endpoints)
+	client := NewBinanceClient("", "", false, nil)
+
+	// First, fetch and log the full exchangeInfo response to see tag data structure
+	fmt.Printf("\n=== Fetching exchangeInfo to inspect tag data ===\n")
+	endpoint := fmt.Sprintf("%s/exchangeInfo", client.apiPath("v3"))
+	response, err := client.doGet(endpoint)
+	if err != nil {
+		t.Fatalf("failed to fetch exchange info: %v", err)
+	}
+
+	// Log the full raw JSON response (using fmt.Printf so it always shows)
+	fmt.Printf("Full exchangeInfo API Response (raw JSON):\n")
+	fmt.Printf("Response length: %d bytes\n\n", len(response))
+
+	// Pretty print the JSON for readability
+	var prettyJSON interface{}
+	if err := json.Unmarshal(response, &prettyJSON); err == nil {
+		prettyBytes, err := json.MarshalIndent(prettyJSON, "", "  ")
+		if err == nil {
+			// Log in chunks to avoid overwhelming output
+			prettyStr := string(prettyBytes)
+			chunkSize := 5000 // Log in 5000 char chunks
+			for i := 0; i < len(prettyStr); i += chunkSize {
+				end := i + chunkSize
+				if end > len(prettyStr) {
+					end = len(prettyStr)
+				}
+				fmt.Printf("Response chunk [%d:%d]:\n%s\n", i, end, prettyStr[i:end])
+			}
+		} else {
+			// Fallback to raw response if pretty printing fails
+			fmt.Printf("Raw response (first 10000 chars):\n%s\n", string(response[:min(len(response), 10000)]))
+		}
+	} else {
+		// Fallback to raw response if unmarshaling fails
+		fmt.Printf("Raw response (first 10000 chars):\n%s\n", string(response[:min(len(response), 10000)]))
+	}
+
+	// Parse the response to extract tag information
+	var exchangeInfo struct {
+		Symbols []struct {
+			Symbol     string `json:"symbol"`
+			Status     string `json:"status"`
+			BaseAsset  string `json:"baseAsset"`
+			QuoteAsset string `json:"quoteAsset"`
+			Tags       []struct {
+				Name string `json:"name"`
+			} `json:"tags,omitempty"`
+		} `json:"symbols"`
+	}
+
+	if err := json.Unmarshal(response, &exchangeInfo); err != nil {
+		t.Fatalf("failed to parse exchange info: %v", err)
+	}
+
+	// Log statistics about tags
+	fmt.Printf("\n=== Tag Data Analysis ===\n")
+	tagCounts := make(map[string]int)
+	symbolsWithTags := 0
+	symbolsWithMonitoringTag := 0
+	symbolsWithSeedTag := 0
+
+	for _, symbol := range exchangeInfo.Symbols {
+		if len(symbol.Tags) > 0 {
+			symbolsWithTags++
+			for _, tag := range symbol.Tags {
+				tagCounts[tag.Name]++
+				if strings.EqualFold(tag.Name, "Monitoring") {
+					symbolsWithMonitoringTag++
+				}
+				if strings.EqualFold(tag.Name, "Seed") {
+					symbolsWithSeedTag++
+				}
+			}
+		}
+	}
+
+	fmt.Printf("Total symbols: %d\n", len(exchangeInfo.Symbols))
+	fmt.Printf("Symbols with tags: %d\n", symbolsWithTags)
+	fmt.Printf("Symbols with 'Monitoring' tag: %d\n", symbolsWithMonitoringTag)
+	fmt.Printf("Symbols with 'Seed' tag: %d\n", symbolsWithSeedTag)
+	fmt.Printf("\nTag distribution:\n")
+	for tagName, count := range tagCounts {
+		fmt.Printf("  %s: %d symbols\n", tagName, count)
+	}
+
+	// Show examples of symbols with tags
+	fmt.Printf("\n=== Example symbols with tags ===\n")
+	examplesShown := 0
+	for _, symbol := range exchangeInfo.Symbols {
+		if len(symbol.Tags) > 0 && examplesShown < 10 {
+			tagNames := make([]string, len(symbol.Tags))
+			for i, tag := range symbol.Tags {
+				tagNames[i] = tag.Name
+			}
+			fmt.Printf("  %s (%s/%s): tags=%v\n", symbol.Symbol, symbol.BaseAsset, symbol.QuoteAsset, tagNames)
+			examplesShown++
+		}
+	}
+
+	// Now test FindScalpingCoins
+	fmt.Printf("\n=== Testing FindScalpingCoins ===\n")
+	coins, err := client.FindScalpingCoins(
+		"USDT",               // quoteAsset
+		1000000,              // minVolume: 1M USDT
+		10,                   // topN: top 10 coins
+		100*time.Millisecond, // rateLimitDelay
+		0.5,                  // maxSpread: 0.5%
+	)
+
+	if err != nil {
+		t.Fatalf("failed to find scalping coins: %v", err)
+	}
+
+	if len(coins) == 0 {
+		t.Fatal("expected at least one scalping coin, got 0")
+	}
+
+	fmt.Printf("\n=== Top Scalping Coins (found %d) ===\n", len(coins))
+	for i, coin := range coins {
+		fmt.Printf("%d. %s (%s)\n", i+1, coin.Code, coin.Symbol)
+		fmt.Printf("   Volume: %.2f USDT\n", coin.Volume)
+		fmt.Printf("   Volatility: %.4f%%\n", coin.Volatility)
+		fmt.Printf("   Spread: %.4f%%\n", coin.Spread)
+		fmt.Printf("   Score: %.4f\n", coin.Score)
+		fmt.Printf("\n")
+	}
+
+	// Validate results
+	if coins[0].Symbol == "" {
+		t.Error("expected non-empty symbol for first coin")
+	}
+	if coins[0].Volume <= 0 {
+		t.Error("expected positive volume for first coin")
+	}
+	if coins[0].Score <= 0 {
+		t.Error("expected positive score for first coin")
+	}
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
