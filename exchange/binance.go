@@ -1249,6 +1249,12 @@ func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]
 
 // GetTradingPairs returns all available trading pairs
 func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
+	return c.GetTradingPairsWithFilter(false)
+}
+
+// GetTradingPairsWithFilter returns trading pairs with optional filtering of Seed tokens.
+// filterSeedTokens: if true, excludes tokens marked with "Seed" tag (high-risk tokens with potential total loss).
+func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]common.TradingPair, error) {
 	endpoint := fmt.Sprintf("%s/exchangeInfo", c.apiPath("v3"))
 	response, err := c.doGet(endpoint)
 	if err != nil {
@@ -1257,10 +1263,11 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 
 	var exchangeInfo struct {
 		Symbols []struct {
-			Symbol     string `json:"symbol"`
-			Status     string `json:"status"`
-			BaseAsset  string `json:"baseAsset"`
-			QuoteAsset string `json:"quoteAsset"`
+			Symbol     string   `json:"symbol"`
+			Status     string   `json:"status"`
+			BaseAsset  string   `json:"baseAsset"`
+			QuoteAsset string   `json:"quoteAsset"`
+			Tags       []string `json:"tags,omitempty"`
 		} `json:"symbols"`
 		BinanceResponse
 	}
@@ -1271,13 +1278,29 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 
 	var tradingPairs []common.TradingPair
 	for _, symbol := range exchangeInfo.Symbols {
-		if symbol.Status == "TRADING" {
-			tradingPairs = append(tradingPairs, common.TradingPair{
-				Symbol:     symbol.Symbol,
-				BaseAsset:  symbol.BaseAsset,
-				QuoteAsset: symbol.QuoteAsset,
-			})
+		if symbol.Status != "TRADING" {
+			continue
 		}
+
+		// Filter out Seed tokens if requested
+		if filterSeedTokens {
+			hasSeedTag := false
+			for _, tag := range symbol.Tags {
+				if strings.EqualFold(tag, "Seed") {
+					hasSeedTag = true
+					break
+				}
+			}
+			if hasSeedTag {
+				continue
+			}
+		}
+
+		tradingPairs = append(tradingPairs, common.TradingPair{
+			Symbol:     symbol.Symbol,
+			BaseAsset:  symbol.BaseAsset,
+			QuoteAsset: symbol.QuoteAsset,
+		})
 	}
 
 	return tradingPairs, nil
@@ -1330,8 +1353,9 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 	quoteAsset = strings.ToUpper(quoteAsset)
 	logger := common.DefaultLogger()
 
-	// Get all trading pairs
-	tradingPairs, err := c.GetTradingPairs()
+	// Get all trading pairs, filtering out Seed tokens (high-risk tokens with potential total loss)
+	// Seed tokens are not suitable for scalping due to their high volatility and risk of total loss
+	tradingPairs, err := c.GetTradingPairsWithFilter(true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get trading pairs: %w", err)
 	}
