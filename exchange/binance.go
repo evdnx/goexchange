@@ -1409,19 +1409,27 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 		askPrice := ticker.parseAskPrice()
 		priceChangePercent := ticker.parsePriceChangePercent()
 
+		// Validate basic price data
+		if lastPrice <= 0 || bidPrice <= 0 || askPrice <= 0 {
+			continue // Skip invalid price data
+		}
+
 		// Filter by minimum volume
 		if volume < minVolume {
 			volumeFiltered++
 			continue
 		}
 
-		// Calculate spread
+		// Calculate spread - ensure askPrice >= bidPrice for valid spread
 		var spread float64
-		if bidPrice > 0 && askPrice > 0 && askPrice >= bidPrice {
+		if askPrice >= bidPrice {
 			midPrice := (bidPrice + askPrice) / 2
 			if midPrice > 0 {
 				spread = ((askPrice - bidPrice) / midPrice) * 100
 			}
+		} else {
+			// Invalid spread (ask < bid), skip this coin
+			continue
 		}
 
 		// Filter by maximum spread
@@ -1462,9 +1470,12 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 	})
 
 	// Only analyze top 2*topN candidates in detail (to account for order book filtering)
+	// This optimization reduces API calls while ensuring we have enough candidates
+	// after detailed analysis filtering
 	detailedCandidates := candidates
-	if len(candidates) > topN*2 {
-		detailedCandidates = candidates[:topN*2]
+	maxDetailedCandidates := topN * 3 // Increased to 3x to account for filtering
+	if len(candidates) > maxDetailedCandidates {
+		detailedCandidates = candidates[:maxDetailedCandidates]
 	}
 
 	// PHASE 2: Parallel fetch detailed data (candles and order books) for top candidates
@@ -1480,10 +1491,24 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 	var wg sync.WaitGroup
 	since := time.Now().Add(-24 * time.Hour)
 
-	for _, cand := range detailedCandidates {
+	for i, cand := range detailedCandidates {
 		wg.Add(1)
-		go func(cand candidateData) {
+		go func(cand candidateData, index int) {
 			defer wg.Done()
+
+			// Respect rate limiting: stagger requests to avoid hitting rate limits
+			// Each goroutine waits a bit longer based on its index
+			if index > 0 {
+				delay := rateLimitDelay * time.Duration(index%10) // Stagger within batches of 10
+				select {
+				case <-ctx.Done():
+					resultChan <- detailedResult{err: fmt.Errorf("context cancelled during rate limiting: %w", ctx.Err())}
+					return
+				case <-time.After(delay):
+					// Continue after delay
+				}
+			}
+
 			semaphore <- struct{}{}        // Acquire semaphore
 			defer func() { <-semaphore }() // Release semaphore
 
@@ -1507,9 +1532,13 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 			hasOrderBook := false
 			if err == nil && orderBook != nil {
 				hasOrderBook = true
+				// Use the most accurate mid price available
 				midPrice := cand.lastPrice
 				if midPrice <= 0 {
-					midPrice = (cand.bidPrice + cand.askPrice) / 2
+					// Fallback to bid/ask average if lastPrice is invalid
+					if cand.bidPrice > 0 && cand.askPrice > 0 && cand.askPrice >= cand.bidPrice {
+						midPrice = (cand.bidPrice + cand.askPrice) / 2
+					}
 				}
 				if midPrice > 0 {
 					liquidityScore = calculateOrderBookLiquidity(orderBook, midPrice)
@@ -1535,7 +1564,7 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 				coin:       coin,
 				hasDetails: hasOrderBook,
 			}
-		}(cand)
+		}(cand, i)
 	}
 
 	// Close channel when all goroutines complete
@@ -1816,14 +1845,17 @@ func calculateOrderBookImbalance(orderBook *models.OrderBook) float64 {
 
 // calculatePriceImpactFactor estimates the price impact of a typical scalping trade.
 // Lower values = better (less slippage). Returns a factor typically between 0.5 and 5.0.
+// Uses a fixed trade size of $1000 USDT (or equivalent in quote currency) which represents
+// a typical scalping trade size, independent of coin price.
 func calculatePriceImpactFactor(orderBook *models.OrderBook, midPrice float64) float64 {
 	if orderBook == nil || midPrice <= 0 {
 		return 1.0
 	}
 
-	// Estimate price impact for a trade size of 0.1% of typical daily volume
-	// This represents a typical scalping trade size
-	typicalTradeSize := midPrice * 0.001 // 0.1% of price in quote currency
+	// Use a fixed trade size of $1000 in quote currency for scalping
+	// This is independent of coin price and represents a typical scalping trade size
+	// For scalping, coin cost does not matter - we use a fixed position size
+	typicalTradeSize := 1000.0 // Fixed $1000 trade size in quote currency
 
 	var bidImpact, askImpact float64
 
