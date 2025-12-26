@@ -26,6 +26,7 @@ import (
 	"github.com/evdnx/golog"
 	metrics "github.com/evdnx/gotrademetrics"
 	"github.com/evdnx/gowscl"
+	"golang.org/x/net/html"
 )
 
 // BinanceClient implements the ExchangeClient interface for Binance spot and futures trading
@@ -123,6 +124,22 @@ const (
 )
 
 const binanceHTTPTimeout = 10 * time.Second
+
+// taggedCoinsCache caches the list of Seed and Monitoring tagged coins
+// to avoid excessive scraping. Cache expires after 24 hours.
+type taggedCoinsCache struct {
+	mu              sync.RWMutex
+	monitoringCoins map[string]bool // base asset -> true
+	seedCoins       map[string]bool // base asset -> true
+	lastUpdate      time.Time
+	cacheDuration   time.Duration
+}
+
+var globalTaggedCoinsCache = &taggedCoinsCache{
+	monitoringCoins: make(map[string]bool),
+	seedCoins:       make(map[string]bool),
+	cacheDuration:   24 * time.Hour,
+}
 
 // NewBinanceClient creates a new Binance client for spot and futures trading.
 // If apiKey or apiSecret are empty strings, they will be read from environment variables
@@ -1247,6 +1264,378 @@ func (c *BinanceClient) GetOrders(symbol string, since time.Time, limit int) ([]
 	return orders, nil
 }
 
+// getTaggedCoinsFromWeb scrapes Binance web pages to get lists of coins tagged as Monitoring or Seed.
+// Returns sets of base asset symbols (e.g., "BTC", "ETH") that should be excluded.
+func getTaggedCoinsFromWeb(ctx context.Context, httpClient *gohttpcl.Client) (monitoringCoins, seedCoins map[string]bool, err error) {
+	monitoringCoins = make(map[string]bool)
+	seedCoins = make(map[string]bool)
+
+	// Scrape Monitoring page
+	monitoringURL := "https://www.binance.com/en/markets/coinInfo-Monitoring"
+	monitoringSymbols, err := scrapeBinanceTagPage(ctx, httpClient, monitoringURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to scrape Monitoring page: %w", err)
+	}
+	for _, symbol := range monitoringSymbols {
+		monitoringCoins[strings.ToUpper(symbol)] = true
+	}
+
+	// Scrape Seed page
+	seedURL := "https://www.binance.com/en/markets/coinInfo-Seed"
+	seedSymbols, err := scrapeBinanceTagPage(ctx, httpClient, seedURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to scrape Seed page: %w", err)
+	}
+	for _, symbol := range seedSymbols {
+		seedCoins[strings.ToUpper(symbol)] = true
+	}
+
+	return monitoringCoins, seedCoins, nil
+}
+
+// scrapeBinanceTagPage scrapes a Binance tag page and extracts coin symbols.
+// The page structure may vary, so this function tries multiple parsing strategies.
+func scrapeBinanceTagPage(ctx context.Context, httpClient *gohttpcl.Client, url string) ([]string, error) {
+	timeout := binanceHTTPTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	// Set User-Agent to avoid being blocked
+	headers := map[string]string{
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+		"Accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	}
+
+	options := headerOptions(headers)
+	resp, err := httpClient.Get(ctx, url, timeout, nil, options...)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("HTTP error: status code %d", resp.StatusCode)
+	}
+
+	// Parse HTML
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %w", err)
+	}
+
+	// Extract symbols from the page
+	// Binance pages typically have coin symbols in various formats.
+	// We'll look for common patterns like data attributes, class names, or text content.
+	var symbols []string
+	symbolSet := make(map[string]bool)
+
+	// Strategy 1: Look for data-symbol or similar attributes
+	var extractFromNode func(*html.Node)
+	extractFromNode = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			// Check for data-symbol attribute
+			for _, attr := range n.Attr {
+				if attr.Key == "data-symbol" || attr.Key == "data-base-asset" {
+					symbol := strings.TrimSpace(attr.Val)
+					if symbol != "" && !symbolSet[symbol] {
+						symbols = append(symbols, symbol)
+						symbolSet[symbol] = true
+					}
+				}
+			}
+
+			// Check for text content that looks like a coin symbol (2-10 uppercase letters/numbers)
+			if n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+				text := strings.TrimSpace(n.FirstChild.Data)
+				// Match patterns like "BTC", "ETH", "USDT", etc. (2-10 alphanumeric uppercase)
+				if len(text) >= 2 && len(text) <= 10 {
+					upperText := strings.ToUpper(text)
+					if isCoinSymbol(upperText) && !symbolSet[upperText] {
+						// Only add if it's in a likely context (e.g., within a table cell, link, or span)
+						if isSymbolContext(n) {
+							symbols = append(symbols, upperText)
+							symbolSet[upperText] = true
+						}
+					}
+				}
+			}
+		}
+
+		// Recursively process children
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			extractFromNode(child)
+		}
+	}
+
+	extractFromNode(doc)
+
+	// Strategy 2: Look for JSON data embedded in script tags
+	// Many modern web pages load data via JavaScript, which might be in script tags
+	var extractFromScripts func(*html.Node)
+	extractFromScripts = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "script" {
+			if n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+				scriptContent := n.FirstChild.Data
+				// Try to find JSON arrays or objects containing symbol data
+				// Look for patterns like ["BTC","ETH","USDT"] or {"symbol":"BTC"}
+				symbolsFromScript := extractSymbolsFromScript(scriptContent)
+				for _, sym := range symbolsFromScript {
+					if !symbolSet[sym] {
+						symbols = append(symbols, sym)
+						symbolSet[sym] = true
+					}
+				}
+			}
+		}
+
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			extractFromScripts(child)
+		}
+	}
+
+	extractFromScripts(doc)
+
+	if len(symbols) == 0 {
+		// Fallback: try to find any text that looks like a coin symbol in the page
+		// This is a last resort and may include false positives
+		var fallbackExtract func(*html.Node)
+		fallbackExtract = func(n *html.Node) {
+			if n.Type == html.TextNode {
+				text := strings.TrimSpace(n.Data)
+				words := strings.Fields(text)
+				for _, word := range words {
+					upperWord := strings.ToUpper(word)
+					if isCoinSymbol(upperWord) && len(upperWord) >= 2 && len(upperWord) <= 10 {
+						if !symbolSet[upperWord] {
+							symbols = append(symbols, upperWord)
+							symbolSet[upperWord] = true
+						}
+					}
+				}
+			}
+			for child := n.FirstChild; child != nil; child = child.NextSibling {
+				fallbackExtract(child)
+			}
+		}
+		fallbackExtract(doc)
+	}
+
+	return symbols, nil
+}
+
+// isCoinSymbol checks if a string looks like a valid coin symbol
+func isCoinSymbol(s string) bool {
+	if len(s) < 2 || len(s) > 10 {
+		return false
+	}
+	// Coin symbols are typically uppercase alphanumeric
+	for _, r := range s {
+		if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+// isSymbolContext checks if a node is in a context where a coin symbol is likely to appear
+func isSymbolContext(n *html.Node) bool {
+	tagName := strings.ToLower(n.Data)
+	// Common tags where symbols appear
+	symbolTags := map[string]bool{
+		"td": true, "th": true, "span": true, "div": true,
+		"a": true, "p": true, "li": true, "strong": true,
+	}
+	return symbolTags[tagName]
+}
+
+// extractSymbolsFromScript tries to extract coin symbols from JavaScript/JSON in script tags
+func extractSymbolsFromScript(scriptContent string) []string {
+	var symbols []string
+	symbolSet := make(map[string]bool)
+
+	// Strategy 1: Look for JSON arrays like ["BTC","ETH","USDT"]
+	// Find patterns like ["SYMBOL","SYMBOL"] or ['SYMBOL','SYMBOL']
+	start := 0
+	for {
+		// Find array start
+		arrayStart := strings.Index(scriptContent[start:], `["`)
+		if arrayStart == -1 {
+			arrayStart = strings.Index(scriptContent[start:], `['`)
+		}
+		if arrayStart == -1 {
+			break
+		}
+		arrayStart += start
+
+		// Find array end
+		arrayEnd := strings.Index(scriptContent[arrayStart:], `]`)
+		if arrayEnd == -1 {
+			start = arrayStart + 1
+			continue
+		}
+		arrayEnd += arrayStart + 1
+
+		// Extract array content
+		arrayContent := scriptContent[arrayStart:arrayEnd]
+
+		// Parse quoted strings from the array
+		// Look for patterns like "SYMBOL" or 'SYMBOL'
+		quoteStart := 0
+		for quoteStart < len(arrayContent) {
+			quoteIdx := strings.IndexAny(arrayContent[quoteStart:], `"'`)
+			if quoteIdx == -1 {
+				break
+			}
+			quoteIdx += quoteStart
+			quoteChar := arrayContent[quoteIdx]
+
+			// Find closing quote
+			closeQuote := strings.Index(arrayContent[quoteIdx+1:], string(quoteChar))
+			if closeQuote == -1 {
+				break
+			}
+			closeQuote += quoteIdx + 1
+
+			// Extract symbol
+			symbol := arrayContent[quoteIdx+1 : closeQuote]
+			symbol = strings.TrimSpace(symbol)
+			if isCoinSymbol(symbol) && !symbolSet[symbol] {
+				symbols = append(symbols, symbol)
+				symbolSet[symbol] = true
+			}
+
+			quoteStart = closeQuote + 1
+		}
+		start = arrayEnd
+	}
+
+	// Strategy 2: Look for JSON objects with symbol fields
+	// Find patterns like {"symbol":"BTC"} or {symbol:'ETH'}
+	objStart := 0
+	for {
+		objIdx := strings.Index(scriptContent[objStart:], `"symbol"`)
+		if objIdx == -1 {
+			objIdx = strings.Index(scriptContent[objStart:], `'symbol'`)
+		}
+		if objIdx == -1 {
+			break
+		}
+		objIdx += objStart
+
+		// Find the value after the colon
+		colonIdx := strings.Index(scriptContent[objIdx:], `:`)
+		if colonIdx == -1 {
+			break
+		}
+		colonIdx += objIdx + 1
+
+		// Skip whitespace
+		for colonIdx < len(scriptContent) && (scriptContent[colonIdx] == ' ' || scriptContent[colonIdx] == '\t') {
+			colonIdx++
+		}
+
+		// Extract quoted value
+		if colonIdx < len(scriptContent) {
+			quoteChar := scriptContent[colonIdx]
+			if quoteChar == '"' || quoteChar == '\'' {
+				closeQuote := strings.Index(scriptContent[colonIdx+1:], string(quoteChar))
+				if closeQuote != -1 {
+					symbol := scriptContent[colonIdx+1 : colonIdx+1+closeQuote]
+					symbol = strings.TrimSpace(symbol)
+					if isCoinSymbol(symbol) && !symbolSet[symbol] {
+						symbols = append(symbols, symbol)
+						symbolSet[symbol] = true
+					}
+				}
+			}
+		}
+
+		objStart = objIdx + 1
+	}
+
+	// Strategy 3: Simple word-based extraction (fallback)
+	words := strings.Fields(scriptContent)
+	for _, word := range words {
+		// Remove quotes, brackets, and common punctuation
+		cleaned := strings.Trim(word, `"'[]{}:,;`)
+		if isCoinSymbol(cleaned) && !symbolSet[cleaned] {
+			symbols = append(symbols, cleaned)
+			symbolSet[cleaned] = true
+		}
+	}
+
+	return symbols
+}
+
+// getCachedTaggedCoins returns cached tagged coins, or fetches and caches them if expired
+func (c *BinanceClient) getCachedTaggedCoins(ctx context.Context) (monitoringCoins, seedCoins map[string]bool, err error) {
+	globalTaggedCoinsCache.mu.RLock()
+	needsUpdate := time.Since(globalTaggedCoinsCache.lastUpdate) > globalTaggedCoinsCache.cacheDuration
+	globalTaggedCoinsCache.mu.RUnlock()
+
+	if !needsUpdate {
+		globalTaggedCoinsCache.mu.RLock()
+		defer globalTaggedCoinsCache.mu.RUnlock()
+		// Return copies of the maps
+		monitoringCopy := make(map[string]bool, len(globalTaggedCoinsCache.monitoringCoins))
+		seedCopy := make(map[string]bool, len(globalTaggedCoinsCache.seedCoins))
+		for k, v := range globalTaggedCoinsCache.monitoringCoins {
+			monitoringCopy[k] = v
+		}
+		for k, v := range globalTaggedCoinsCache.seedCoins {
+			seedCopy[k] = v
+		}
+		return monitoringCopy, seedCopy, nil
+	}
+
+	// Cache expired, fetch fresh data
+	monitoringCoins, seedCoins, err = getTaggedCoinsFromWeb(ctx, c.httpClient)
+	if err != nil {
+		// On error, return cached data if available (even if expired)
+		globalTaggedCoinsCache.mu.RLock()
+		defer globalTaggedCoinsCache.mu.RUnlock()
+		if len(globalTaggedCoinsCache.monitoringCoins) > 0 || len(globalTaggedCoinsCache.seedCoins) > 0 {
+			monitoringCopy := make(map[string]bool, len(globalTaggedCoinsCache.monitoringCoins))
+			seedCopy := make(map[string]bool, len(globalTaggedCoinsCache.seedCoins))
+			for k, v := range globalTaggedCoinsCache.monitoringCoins {
+				monitoringCopy[k] = v
+			}
+			for k, v := range globalTaggedCoinsCache.seedCoins {
+				seedCopy[k] = v
+			}
+			return monitoringCopy, seedCopy, nil
+		}
+		return nil, nil, err
+	}
+
+	// Only update cache if we got results (don't cache empty results)
+	// This prevents caching empty maps which would cause filtering to fail
+	if len(monitoringCoins) > 0 || len(seedCoins) > 0 {
+		globalTaggedCoinsCache.mu.Lock()
+		globalTaggedCoinsCache.monitoringCoins = monitoringCoins
+		globalTaggedCoinsCache.seedCoins = seedCoins
+		globalTaggedCoinsCache.lastUpdate = time.Now()
+		globalTaggedCoinsCache.mu.Unlock()
+	} else {
+		// If scraping returned empty results, log a warning but don't cache
+		// This allows API tags to be used as fallback
+		logger := common.DefaultLogger()
+		logger.Warnf("Scraping returned empty tagged coins list - using API tags as fallback")
+	}
+
+	return monitoringCoins, seedCoins, nil
+}
+
+// ClearTaggedCoinsCache clears the cached tagged coins, forcing a fresh scrape on next request
+func (c *BinanceClient) ClearTaggedCoinsCache() {
+	globalTaggedCoinsCache.mu.Lock()
+	defer globalTaggedCoinsCache.mu.Unlock()
+	globalTaggedCoinsCache.monitoringCoins = make(map[string]bool)
+	globalTaggedCoinsCache.seedCoins = make(map[string]bool)
+	globalTaggedCoinsCache.lastUpdate = time.Time{} // Zero time forces refresh
+}
+
 // GetTradingPairs returns all available trading pairs
 func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 	return c.GetTradingPairsWithFilter(false)
@@ -1254,7 +1643,9 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 
 // GetTradingPairsWithFilter returns trading pairs with optional filtering of Seed tokens.
 // Always excludes tokens marked with "Monitoring" tag (tokens under observation, not suitable for trading).
-// filterSeedTokens: if true, excludes tokens marked with "Seed" tag (high-risk tokens with potential total loss).
+// Always excludes tokens marked with "Seed" tag (high-risk tokens with potential total loss).
+// Uses web scraping to get the most up-to-date list of tagged coins, as Binance APIs don't include tag data.
+// filterSeedTokens: deprecated parameter, kept for backward compatibility. Seed tokens are always filtered.
 func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]common.TradingPair, error) {
 	endpoint := fmt.Sprintf("%s/exchangeInfo", c.apiPath("v3"))
 	response, err := c.doGet(endpoint)
@@ -1268,9 +1659,6 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 			Status     string `json:"status"`
 			BaseAsset  string `json:"baseAsset"`
 			QuoteAsset string `json:"quoteAsset"`
-			Tags       []struct {
-				Name string `json:"name"`
-			} `json:"tags,omitempty"`
 		} `json:"symbols"`
 		BinanceResponse
 	}
@@ -1279,34 +1667,47 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 		return nil, fmt.Errorf("failed to parse exchange info: %w", err)
 	}
 
+	// Get tagged coins from web scraping (primary source)
+	ctx := context.Background()
+	monitoringCoins, seedCoins, scrapeErr := c.getCachedTaggedCoins(ctx)
+
+	logger := common.DefaultLogger()
+	if scrapeErr != nil {
+		logger.Warnf("Failed to scrape tagged coins from web - Monitoring and Seed coins may not be filtered: %v", scrapeErr)
+	} else {
+		logger.Debugf("Scraped tagged coins: Monitoring=%d, Seed=%d", len(monitoringCoins), len(seedCoins))
+		// Log a few examples for debugging
+		if len(monitoringCoins) > 0 {
+			count := 0
+			for coin := range monitoringCoins {
+				if count < 5 {
+					logger.Debugf("  Monitoring coin: %s", coin)
+					count++
+				}
+			}
+		}
+	}
+
 	var tradingPairs []common.TradingPair
 	for _, symbol := range exchangeInfo.Symbols {
 		if symbol.Status != "TRADING" {
 			continue
 		}
 
-		// Filter out tokens with Monitoring tag (not suitable for trading)
-		hasMonitoringTag := false
-		for _, tag := range symbol.Tags {
-			if strings.EqualFold(tag.Name, "Monitoring") {
-				hasMonitoringTag = true
-				break
+		baseAsset := strings.ToUpper(symbol.BaseAsset)
+
+		// Filter out Monitoring coins (always excluded)
+		// Only use scraped data since API doesn't include tags
+		if scrapeErr == nil && len(monitoringCoins) > 0 {
+			if monitoringCoins[baseAsset] {
+				continue
 			}
-		}
-		if hasMonitoringTag {
-			continue
 		}
 
-		// Filter out Seed tokens if requested
-		if filterSeedTokens {
-			hasSeedTag := false
-			for _, tag := range symbol.Tags {
-				if strings.EqualFold(tag.Name, "Seed") {
-					hasSeedTag = true
-					break
-				}
-			}
-			if hasSeedTag {
+		// Filter out Seed coins (always excluded)
+		// Only use scraped data since API doesn't include tags
+		if scrapeErr == nil && len(seedCoins) > 0 {
+			if seedCoins[baseAsset] {
 				continue
 			}
 		}
