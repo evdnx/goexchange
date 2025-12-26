@@ -2907,6 +2907,10 @@ func (c *BinanceWebSocketClient) replaceClient(url string) {
 	c.ws = gowscl.NewClient(
 		url,
 		gowscl.WithLogger(common.DefaultLogger()),
+		gowscl.WithInitialReconnect(1*time.Second),
+		gowscl.WithMaxReconnect(60*time.Second),
+		gowscl.WithReconnectFactor(2.0),
+		gowscl.WithReconnectJitter(0.1),
 		gowscl.WithOnMessage(func(data []byte, typ gowscl.MessageType) {
 			if err := c.HandleMessage(data); err != nil {
 				c.logger.Warnf("[%s] websocket message handling failed: %v", binanceWSComponent, err)
@@ -2922,6 +2926,24 @@ func (c *BinanceWebSocketClient) replaceClient(url string) {
 			c.setConnected(false)
 		}),
 		gowscl.WithOnError(func(err error) {
+			// Filter out expected errors that occur during connection teardown or timeouts
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "failed to ping: use of closed network connection") ||
+				strings.Contains(errMsg, "failed to get reader: context deadline exceeded") {
+				// These are expected errors during connection teardown or timeouts
+				// Only log at debug level if connection is already closed
+				c.connMu.RLock()
+				isConnected := c.connected
+				c.connMu.RUnlock()
+				if !isConnected {
+					// Connection is already closed, this is expected
+					return
+				}
+				// Connection is still marked as connected, log at debug level
+				c.logger.Debugf("[%s] websocket error (expected): %v", binanceWSComponent, err)
+				return
+			}
+			// Log unexpected errors
 			c.logger.Warnf("[%s] websocket error: %v", binanceWSComponent, err)
 		}),
 	)
