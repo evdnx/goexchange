@@ -2766,14 +2766,18 @@ const (
 	wsMessageText gowscl.MessageType = 1
 )
 
-// BinanceTicker represents a WebSocket ticker update
+// BinanceTicker represents a WebSocket miniTicker update (provides OHLCV data)
+// Format: https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#individual-symbol-mini-ticker-stream
 type BinanceTicker struct {
-	Symbol    string `json:"s"`
-	LastPrice string `json:"c"`
-	Volume    string `json:"v"`
-	BidPrice  string `json:"b"`
-	AskPrice  string `json:"a"`
-	CloseTime int64  `json:"C"`
+	EventType string `json:"e"` // Event type (e.g., "24hrMiniTicker")
+	EventTime int64  `json:"E"` // Event time
+	Symbol    string `json:"s"` // Symbol
+	Close     string `json:"c"` // Close price (last price)
+	Open      string `json:"o"` // Open price
+	High      string `json:"h"` // High price
+	Low       string `json:"l"` // Low price
+	Volume    string `json:"v"` // Total traded base asset volume
+	QuoteVol  string `json:"q"` // Total traded quote asset volume
 }
 
 // BinanceKlineStream represents a WebSocket kline update
@@ -2818,7 +2822,7 @@ type BinanceTickerSubscription struct {
 }
 
 func (s *BinanceTickerSubscription) StreamName() string {
-	return fmt.Sprintf("%s@ticker", strings.ToLower(convertToBinanceSymbol(s.Symbol)))
+	return fmt.Sprintf("%s@miniTicker", strings.ToLower(convertToBinanceSymbol(s.Symbol)))
 }
 
 func (s *BinanceTickerSubscription) Subscribe(sender wsMessageSender) error {
@@ -3026,24 +3030,36 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 	}
 
 	switch {
-	case strings.Contains(streamData.Stream, "@ticker"):
+	case strings.Contains(streamData.Stream, "@miniTicker"):
 		var ticker BinanceTicker
 		if err := json.Unmarshal(streamData.Data, &ticker); err != nil {
 			return err
 		}
 		if cb, ok := callback.(func(models.Ticker)); ok {
-			lastPrice, _ := strconv.ParseFloat(ticker.LastPrice, 64)
+			closePrice, _ := strconv.ParseFloat(ticker.Close, 64)
+			openPrice, _ := strconv.ParseFloat(ticker.Open, 64)
+			highPrice, _ := strconv.ParseFloat(ticker.High, 64)
+			lowPrice, _ := strconv.ParseFloat(ticker.Low, 64)
 			volume, _ := strconv.ParseFloat(ticker.Volume, 64)
-			bidPrice, _ := strconv.ParseFloat(ticker.BidPrice, 64)
-			askPrice, _ := strconv.ParseFloat(ticker.AskPrice, 64)
+			
+			// Use EventTime if available, otherwise fallback to current time
+			timestamp := time.Now()
+			if ticker.EventTime > 0 {
+				timestamp = time.Unix(ticker.EventTime/1000, 0)
+			}
+			
 			cb(models.Ticker{
 				Exchange:  "Binance",
 				Symbol:    convertFromBinanceSymbol(ticker.Symbol),
-				LastPrice: lastPrice,
+				LastPrice: closePrice, // Close price is the last price
+				Open:      openPrice,
+				High:      highPrice,
+				Low:       lowPrice,
+				Close:     closePrice,
 				Volume:    volume,
-				Bid:       bidPrice,
-				Ask:       askPrice,
-				Timestamp: time.Unix(ticker.CloseTime/1000, 0),
+				Bid:       0, // miniTicker doesn't include bid/ask, use 0 or subscribe to bookTicker separately
+				Ask:       0, // miniTicker doesn't include bid/ask, use 0 or subscribe to bookTicker separately
+				Timestamp: timestamp,
 			})
 		}
 	case strings.Contains(streamData.Stream, "@kline"):

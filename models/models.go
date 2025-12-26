@@ -65,6 +65,11 @@ type Ticker struct {
 	Volume    float64
 	Bid       float64
 	Ask       float64
+	// OHLC fields (optional, populated when available from exchange)
+	Open  float64
+	High  float64
+	Low   float64
+	Close float64
 }
 
 // UserData represents user-specific events, e.g. account updates.
