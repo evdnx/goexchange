@@ -2762,13 +2762,17 @@ type BinanceWebSocketClient struct {
 	// HTTP client and base URL for REST API calls (e.g., listen key)
 	httpClient  *gohttpcl.Client
 	restBaseURL string
+
+	// Rate limiting for subscriptions (Binance allows 5 messages/second)
+	subRateLimiter *time.Ticker
+	subRateMu      sync.Mutex
 }
 
 // tickerMergeState holds the latest data from both streams for merging
 type tickerMergeState struct {
 	ohlcv     *models.Ticker // Latest OHLCV data from miniTicker
-	bid       float64         // Latest bid price from bookTicker
-	ask       float64         // Latest ask price from bookTicker
+	bid       float64        // Latest bid price from bookTicker
+	ask       float64        // Latest ask price from bookTicker
 	hasOHLCV  bool           // Whether we have OHLCV data
 	hasBidAsk bool           // Whether we have bid/ask data
 	callback  func(models.Ticker)
@@ -2797,12 +2801,12 @@ type BinanceTicker struct {
 // BinanceBookTicker represents a WebSocket bookTicker update (provides best bid/ask)
 // Format: https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#individual-symbol-book-ticker-streams
 type BinanceBookTicker struct {
-	UpdateID   int64  `json:"u"` // Order book update ID
-	Symbol     string `json:"s"`  // Symbol
-	BidPrice   string `json:"b"`  // Best bid price
-	BidQty     string `json:"B"`  // Best bid quantity
-	AskPrice   string `json:"a"`  // Best ask price
-	AskQty     string `json:"A"`  // Best ask quantity
+	UpdateID int64  `json:"u"` // Order book update ID
+	Symbol   string `json:"s"` // Symbol
+	BidPrice string `json:"b"` // Best bid price
+	BidQty   string `json:"B"` // Best bid quantity
+	AskPrice string `json:"a"` // Best ask price
+	AskQty   string `json:"A"` // Best ask quantity
 }
 
 // BinanceKlineStream represents a WebSocket kline update
@@ -2924,16 +2928,17 @@ func (s *BinanceUserDataSubscription) Subscribe(sender wsMessageSender) error {
 // NewBinanceWebSocketClient creates a new WebSocket client
 func NewBinanceWebSocketClient(wsURL, restBaseURL, apiKey, apiSecret string, httpClient *gohttpcl.Client) *BinanceWebSocketClient {
 	client := &BinanceWebSocketClient{
-		apiKey:        apiKey,
-		apiSecret:     apiSecret,
-		callbacks:     make(map[string]interface{}),
-		subscriptions: make(map[string]binanceSubscription),
-		tickerState:   make(map[string]*tickerMergeState),
-		baseURL:       wsURL,
-		currentURL:    wsURL,
-		logger:        common.DefaultLogger(),
-		httpClient:    httpClient,
-		restBaseURL:   restBaseURL,
+		apiKey:         apiKey,
+		apiSecret:      apiSecret,
+		callbacks:      make(map[string]interface{}),
+		subscriptions:  make(map[string]binanceSubscription),
+		tickerState:    make(map[string]*tickerMergeState),
+		baseURL:        wsURL,
+		currentURL:     wsURL,
+		logger:         common.DefaultLogger(),
+		httpClient:     httpClient,
+		restBaseURL:    restBaseURL,
+		subRateLimiter: time.NewTicker(200 * time.Millisecond), // 5 messages per second max
 	}
 	client.replaceClient(wsURL)
 	return client
@@ -3030,6 +3035,28 @@ func (c *BinanceWebSocketClient) SendMessage(message []byte) error {
 	return ws.Send(message, wsMessageText)
 }
 
+// batchSubscribe subscribes to multiple streams in a single SUBSCRIBE message.
+// This helps avoid rate limiting (Binance allows 5 messages/second).
+func (c *BinanceWebSocketClient) batchSubscribe(streamNames []string) error {
+	if len(streamNames) == 0 {
+		return nil
+	}
+
+	// Rate limit: wait for ticker to ensure we don't exceed 5 messages/second
+	c.subRateMu.Lock()
+	<-c.subRateLimiter.C
+	c.subRateMu.Unlock()
+
+	// Build batch subscription message
+	paramsJSON, err := json.Marshal(streamNames)
+	if err != nil {
+		return fmt.Errorf("failed to marshal stream names: %w", err)
+	}
+
+	msg := []byte(fmt.Sprintf(`{"method": "SUBSCRIBE", "params": %s, "id": %d}`, paramsJSON, time.Now().Unix()))
+	return c.SendMessage(msg)
+}
+
 // URL returns the current websocket endpoint.
 func (c *BinanceWebSocketClient) URL() string {
 	c.connMu.RLock()
@@ -3074,20 +3101,20 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 		if err := json.Unmarshal(streamData.Data, &ticker); err != nil {
 			return err
 		}
-		
+
 		normalizedSymbol := strings.ToLower(ticker.Symbol)
 		closePrice, _ := strconv.ParseFloat(ticker.Close, 64)
 		openPrice, _ := strconv.ParseFloat(ticker.Open, 64)
 		highPrice, _ := strconv.ParseFloat(ticker.High, 64)
 		lowPrice, _ := strconv.ParseFloat(ticker.Low, 64)
 		volume, _ := strconv.ParseFloat(ticker.Volume, 64)
-		
+
 		// Use EventTime if available, otherwise fallback to current time
 		timestamp := time.Now()
 		if ticker.EventTime > 0 {
 			timestamp = time.Unix(ticker.EventTime/1000, 0)
 		}
-		
+
 		// Create ticker with OHLCV data
 		ohlcvTicker := models.Ticker{
 			Exchange:  "Binance",
@@ -3100,7 +3127,7 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 			Volume:    volume,
 			Timestamp: timestamp,
 		}
-		
+
 		// Update merge state and emit if we have both OHLCV and bid/ask
 		c.tickerMu.Lock()
 		state, exists := c.tickerState[normalizedSymbol]
@@ -3119,7 +3146,7 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 			bid := state.bid
 			ask := state.ask
 			c.tickerMu.Unlock()
-			
+
 			// Merge and emit if we have both
 			if hasBidAsk {
 				mergedTicker := ohlcvTicker
@@ -3133,11 +3160,11 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 		if err := json.Unmarshal(streamData.Data, &bookTicker); err != nil {
 			return err
 		}
-		
+
 		normalizedSymbol := strings.ToLower(bookTicker.Symbol)
 		bidPrice, _ := strconv.ParseFloat(bookTicker.BidPrice, 64)
 		askPrice, _ := strconv.ParseFloat(bookTicker.AskPrice, 64)
-		
+
 		// Update merge state and emit if we have both OHLCV and bid/ask
 		c.tickerMu.Lock()
 		state, exists := c.tickerState[normalizedSymbol]
@@ -3146,7 +3173,7 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 			c.tickerMu.Unlock()
 			return nil
 		}
-		
+
 		// Update bid/ask data
 		state.bid = bidPrice
 		state.ask = askPrice
@@ -3155,7 +3182,7 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 		hasOHLCV := state.hasOHLCV
 		ohlcv := state.ohlcv
 		c.tickerMu.Unlock()
-		
+
 		// Merge and emit if we have both
 		if hasOHLCV && ohlcv != nil {
 			mergedTicker := *ohlcv
@@ -3276,15 +3303,14 @@ func (c *BinanceWebSocketClient) SubscribeToTicker(symbol string, callback func(
 	// Subscribe to miniTicker stream (OHLCV data)
 	miniTickerSub := &BinanceTickerSubscription{Symbol: symbol}
 	miniTickerStreamName := miniTickerSub.StreamName()
-	if err := miniTickerSub.Subscribe(c); err != nil {
-		return fmt.Errorf("failed to subscribe to miniTicker: %w", err)
-	}
 
 	// Subscribe to bookTicker stream (bid/ask data)
 	bookTickerSub := &BinanceBookTickerSubscription{Symbol: symbol}
 	bookTickerStreamName := bookTickerSub.StreamName()
-	if err := bookTickerSub.Subscribe(c); err != nil {
-		return fmt.Errorf("failed to subscribe to bookTicker: %w", err)
+
+	// Batch subscribe to both streams in a single message to avoid rate limiting
+	if err := c.batchSubscribe([]string{miniTickerStreamName, bookTickerStreamName}); err != nil {
+		return fmt.Errorf("failed to batch subscribe to ticker streams: %w", err)
 	}
 
 	// Register callbacks for both streams (they will merge the data)
@@ -3306,10 +3332,10 @@ func (c *BinanceWebSocketClient) SubscribeToKline(symbol, interval string, callb
 		}
 	}
 	sub := &BinanceKlineSubscription{Symbol: symbol, Interval: interval}
-	if err := sub.Subscribe(c); err != nil {
-		return err
-	}
 	streamName := sub.StreamName()
+	if err := c.batchSubscribe([]string{streamName}); err != nil {
+		return fmt.Errorf("failed to subscribe to kline: %w", err)
+	}
 	c.mu.Lock()
 	c.callbacks[streamName] = callback
 	c.subscriptions[streamName] = sub
@@ -3325,10 +3351,10 @@ func (c *BinanceWebSocketClient) SubscribeToTrades(symbol string, callback func(
 		}
 	}
 	sub := &BinanceTradeSubscription{Symbol: symbol}
-	if err := sub.Subscribe(c); err != nil {
-		return err
-	}
 	streamName := sub.StreamName()
+	if err := c.batchSubscribe([]string{streamName}); err != nil {
+		return fmt.Errorf("failed to subscribe to trades: %w", err)
+	}
 	c.mu.Lock()
 	c.callbacks[streamName] = callback
 	c.subscriptions[streamName] = sub
@@ -3344,10 +3370,10 @@ func (c *BinanceWebSocketClient) SubscribeToDepth(symbol string, callback func(m
 		}
 	}
 	sub := &BinanceDepthSubscription{Symbol: symbol}
-	if err := sub.Subscribe(c); err != nil {
-		return err
-	}
 	streamName := sub.StreamName()
+	if err := c.batchSubscribe([]string{streamName}); err != nil {
+		return fmt.Errorf("failed to subscribe to depth: %w", err)
+	}
 	c.mu.Lock()
 	c.callbacks[streamName] = callback
 	c.subscriptions[streamName] = sub
@@ -3367,10 +3393,10 @@ func (c *BinanceWebSocketClient) SubscribeToUserData(callback func(models.UserDa
 		}
 	}
 	sub := &BinanceUserDataSubscription{ListenKey: listenKey}
-	if err := sub.Subscribe(c); err != nil {
-		return err
-	}
 	streamName := sub.StreamName()
+	if err := c.batchSubscribe([]string{streamName}); err != nil {
+		return fmt.Errorf("failed to subscribe to user data: %w", err)
+	}
 	c.mu.Lock()
 	c.callbacks[streamName] = callback
 	c.subscriptions[streamName] = sub
@@ -3535,16 +3561,24 @@ func (c *BinanceWebSocketClient) closeListenKey(listenKey string) error {
 func (c *BinanceWebSocketClient) restoreSubscriptions() error {
 	c.mu.RLock()
 	subs := make([]binanceSubscription, 0, len(c.subscriptions))
+	streamNames := make([]string, 0, len(c.subscriptions))
 	for _, sub := range c.subscriptions {
 		subs = append(subs, sub)
+		streamNames = append(streamNames, sub.StreamName())
 	}
 	c.mu.RUnlock()
 
-	for _, sub := range subs {
-		if err := sub.Subscribe(c); err != nil {
-			return fmt.Errorf("failed to resubscribe to %s: %w", sub.StreamName(), err)
-		}
+	if len(streamNames) == 0 {
+		return nil
 	}
+
+	// Batch all subscriptions to avoid rate limiting
+	// Binance allows up to 1024 streams per connection, so we can batch them all
+	// But we'll still respect the rate limiter
+	if err := c.batchSubscribe(streamNames); err != nil {
+		return fmt.Errorf("failed to batch restore subscriptions: %w", err)
+	}
+
 	return nil
 }
 
