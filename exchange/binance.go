@@ -2748,6 +2748,10 @@ type BinanceWebSocketClient struct {
 	subscriptions map[string]binanceSubscription
 	mu            sync.RWMutex
 
+	// State for merging ticker data (miniTicker + bookTicker)
+	tickerState map[string]*tickerMergeState // key: symbol (normalized)
+	tickerMu    sync.RWMutex
+
 	connMu     sync.RWMutex
 	ws         *gowscl.Client
 	baseURL    string
@@ -2758,6 +2762,16 @@ type BinanceWebSocketClient struct {
 	// HTTP client and base URL for REST API calls (e.g., listen key)
 	httpClient  *gohttpcl.Client
 	restBaseURL string
+}
+
+// tickerMergeState holds the latest data from both streams for merging
+type tickerMergeState struct {
+	ohlcv     *models.Ticker // Latest OHLCV data from miniTicker
+	bid       float64         // Latest bid price from bookTicker
+	ask       float64         // Latest ask price from bookTicker
+	hasOHLCV  bool           // Whether we have OHLCV data
+	hasBidAsk bool           // Whether we have bid/ask data
+	callback  func(models.Ticker)
 }
 
 const (
@@ -2778,6 +2792,17 @@ type BinanceTicker struct {
 	Low       string `json:"l"` // Low price
 	Volume    string `json:"v"` // Total traded base asset volume
 	QuoteVol  string `json:"q"` // Total traded quote asset volume
+}
+
+// BinanceBookTicker represents a WebSocket bookTicker update (provides best bid/ask)
+// Format: https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#individual-symbol-book-ticker-streams
+type BinanceBookTicker struct {
+	UpdateID   int64  `json:"u"` // Order book update ID
+	Symbol     string `json:"s"`  // Symbol
+	BidPrice   string `json:"b"`  // Best bid price
+	BidQty     string `json:"B"`  // Best bid quantity
+	AskPrice   string `json:"a"`  // Best ask price
+	AskQty     string `json:"A"`  // Best ask quantity
 }
 
 // BinanceKlineStream represents a WebSocket kline update
@@ -2826,6 +2851,19 @@ func (s *BinanceTickerSubscription) StreamName() string {
 }
 
 func (s *BinanceTickerSubscription) Subscribe(sender wsMessageSender) error {
+	msg := []byte(fmt.Sprintf(`{"method": "SUBSCRIBE", "params": ["%s"], "id": %d}`, s.StreamName(), time.Now().Unix()))
+	return sender.SendMessage(msg)
+}
+
+type BinanceBookTickerSubscription struct {
+	Symbol string
+}
+
+func (s *BinanceBookTickerSubscription) StreamName() string {
+	return fmt.Sprintf("%s@bookTicker", strings.ToLower(convertToBinanceSymbol(s.Symbol)))
+}
+
+func (s *BinanceBookTickerSubscription) Subscribe(sender wsMessageSender) error {
 	msg := []byte(fmt.Sprintf(`{"method": "SUBSCRIBE", "params": ["%s"], "id": %d}`, s.StreamName(), time.Now().Unix()))
 	return sender.SendMessage(msg)
 }
@@ -2890,6 +2928,7 @@ func NewBinanceWebSocketClient(wsURL, restBaseURL, apiKey, apiSecret string, htt
 		apiSecret:     apiSecret,
 		callbacks:     make(map[string]interface{}),
 		subscriptions: make(map[string]binanceSubscription),
+		tickerState:   make(map[string]*tickerMergeState),
 		baseURL:       wsURL,
 		currentURL:    wsURL,
 		logger:        common.DefaultLogger(),
@@ -3035,32 +3074,94 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 		if err := json.Unmarshal(streamData.Data, &ticker); err != nil {
 			return err
 		}
-		if cb, ok := callback.(func(models.Ticker)); ok {
-			closePrice, _ := strconv.ParseFloat(ticker.Close, 64)
-			openPrice, _ := strconv.ParseFloat(ticker.Open, 64)
-			highPrice, _ := strconv.ParseFloat(ticker.High, 64)
-			lowPrice, _ := strconv.ParseFloat(ticker.Low, 64)
-			volume, _ := strconv.ParseFloat(ticker.Volume, 64)
-			
-			// Use EventTime if available, otherwise fallback to current time
-			timestamp := time.Now()
-			if ticker.EventTime > 0 {
-				timestamp = time.Unix(ticker.EventTime/1000, 0)
+		
+		normalizedSymbol := strings.ToLower(ticker.Symbol)
+		closePrice, _ := strconv.ParseFloat(ticker.Close, 64)
+		openPrice, _ := strconv.ParseFloat(ticker.Open, 64)
+		highPrice, _ := strconv.ParseFloat(ticker.High, 64)
+		lowPrice, _ := strconv.ParseFloat(ticker.Low, 64)
+		volume, _ := strconv.ParseFloat(ticker.Volume, 64)
+		
+		// Use EventTime if available, otherwise fallback to current time
+		timestamp := time.Now()
+		if ticker.EventTime > 0 {
+			timestamp = time.Unix(ticker.EventTime/1000, 0)
+		}
+		
+		// Create ticker with OHLCV data
+		ohlcvTicker := models.Ticker{
+			Exchange:  "Binance",
+			Symbol:    convertFromBinanceSymbol(ticker.Symbol),
+			LastPrice: closePrice,
+			Open:      openPrice,
+			High:      highPrice,
+			Low:       lowPrice,
+			Close:     closePrice,
+			Volume:    volume,
+			Timestamp: timestamp,
+		}
+		
+		// Update merge state and emit if we have both OHLCV and bid/ask
+		c.tickerMu.Lock()
+		state, exists := c.tickerState[normalizedSymbol]
+		if !exists {
+			// Not a merged subscription, use direct callback
+			c.tickerMu.Unlock()
+			if cb, ok := callback.(func(models.Ticker)); ok {
+				cb(ohlcvTicker)
 			}
+		} else {
+			// Update OHLCV data
+			state.ohlcv = &ohlcvTicker
+			state.hasOHLCV = true
+			callback := state.callback
+			hasBidAsk := state.hasBidAsk
+			bid := state.bid
+			ask := state.ask
+			c.tickerMu.Unlock()
 			
-			cb(models.Ticker{
-				Exchange:  "Binance",
-				Symbol:    convertFromBinanceSymbol(ticker.Symbol),
-				LastPrice: closePrice, // Close price is the last price
-				Open:      openPrice,
-				High:      highPrice,
-				Low:       lowPrice,
-				Close:     closePrice,
-				Volume:    volume,
-				Bid:       0, // miniTicker doesn't include bid/ask, use 0 or subscribe to bookTicker separately
-				Ask:       0, // miniTicker doesn't include bid/ask, use 0 or subscribe to bookTicker separately
-				Timestamp: timestamp,
-			})
+			// Merge and emit if we have both
+			if hasBidAsk {
+				mergedTicker := ohlcvTicker
+				mergedTicker.Bid = bid
+				mergedTicker.Ask = ask
+				callback(mergedTicker)
+			}
+		}
+	case strings.Contains(streamData.Stream, "@bookTicker"):
+		var bookTicker BinanceBookTicker
+		if err := json.Unmarshal(streamData.Data, &bookTicker); err != nil {
+			return err
+		}
+		
+		normalizedSymbol := strings.ToLower(bookTicker.Symbol)
+		bidPrice, _ := strconv.ParseFloat(bookTicker.BidPrice, 64)
+		askPrice, _ := strconv.ParseFloat(bookTicker.AskPrice, 64)
+		
+		// Update merge state and emit if we have both OHLCV and bid/ask
+		c.tickerMu.Lock()
+		state, exists := c.tickerState[normalizedSymbol]
+		if !exists {
+			// Not a merged subscription, ignore
+			c.tickerMu.Unlock()
+			return nil
+		}
+		
+		// Update bid/ask data
+		state.bid = bidPrice
+		state.ask = askPrice
+		state.hasBidAsk = true
+		callback := state.callback
+		hasOHLCV := state.hasOHLCV
+		ohlcv := state.ohlcv
+		c.tickerMu.Unlock()
+		
+		// Merge and emit if we have both
+		if hasOHLCV && ohlcv != nil {
+			mergedTicker := *ohlcv
+			mergedTicker.Bid = bidPrice
+			mergedTicker.Ask = askPrice
+			callback(mergedTicker)
 		}
 	case strings.Contains(streamData.Stream, "@kline"):
 		var klineData struct {
@@ -3152,22 +3253,48 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 	return nil
 }
 
-// SubscribeToTicker subscribes to ticker updates
+// SubscribeToTicker subscribes to ticker updates (OHLCV + Bid/Ask)
+// This subscribes to both @miniTicker (for OHLCV) and @bookTicker (for bid/ask) streams
+// and merges the data before calling the callback.
 func (c *BinanceWebSocketClient) SubscribeToTicker(symbol string, callback func(models.Ticker)) error {
 	if !c.IsConnected() {
 		if err := c.Connect(); err != nil {
 			return err
 		}
 	}
-	sub := &BinanceTickerSubscription{Symbol: symbol}
-	if err := sub.Subscribe(c); err != nil {
-		return err
+
+	// Normalize symbol for state tracking
+	normalizedSymbol := strings.ToLower(convertToBinanceSymbol(symbol))
+
+	// Initialize merge state
+	c.tickerMu.Lock()
+	c.tickerState[normalizedSymbol] = &tickerMergeState{
+		callback: callback,
 	}
-	streamName := sub.StreamName()
+	c.tickerMu.Unlock()
+
+	// Subscribe to miniTicker stream (OHLCV data)
+	miniTickerSub := &BinanceTickerSubscription{Symbol: symbol}
+	miniTickerStreamName := miniTickerSub.StreamName()
+	if err := miniTickerSub.Subscribe(c); err != nil {
+		return fmt.Errorf("failed to subscribe to miniTicker: %w", err)
+	}
+
+	// Subscribe to bookTicker stream (bid/ask data)
+	bookTickerSub := &BinanceBookTickerSubscription{Symbol: symbol}
+	bookTickerStreamName := bookTickerSub.StreamName()
+	if err := bookTickerSub.Subscribe(c); err != nil {
+		return fmt.Errorf("failed to subscribe to bookTicker: %w", err)
+	}
+
+	// Register callbacks for both streams (they will merge the data)
 	c.mu.Lock()
-	c.callbacks[streamName] = callback
-	c.subscriptions[streamName] = sub
+	c.callbacks[miniTickerStreamName] = callback
+	c.subscriptions[miniTickerStreamName] = miniTickerSub
+	c.callbacks[bookTickerStreamName] = callback
+	c.subscriptions[bookTickerStreamName] = bookTickerSub
 	c.mu.Unlock()
+
 	return nil
 }
 
