@@ -614,9 +614,12 @@ func (c *BinanceClient) GetTrades(symbol string, since time.Time, limit int) ([]
 	for i, trade := range tradesResponse {
 		price, _ := strconv.ParseFloat(trade.Price, 64)
 		quantity, _ := strconv.ParseFloat(trade.Qty, 64)
-		side := "sell"
+		// isBuyerMaker indicates the buy side was the maker (limit order).
+		// When true, the trade was initiated by a market sell order (taker is seller).
+		// When false, the trade was initiated by a market buy order (taker is buyer).
+		side := "buy"
 		if trade.IsBuyerMaker {
-			side = "buy"
+			side = "sell"
 		}
 
 		trades[i] = models.Trade{
@@ -986,7 +989,7 @@ func (c *BinanceClient) PlaceFuturesOrder(order FuturesOrder) (string, error) {
 
 // CancelOrder cancels a spot market order
 func (c *BinanceClient) CancelOrder(symbol, orderID string) error {
-	endpoint := fmt.Sprintf("%s/api/v3/order", c.baseURL)
+	endpoint := fmt.Sprintf("%s/order", c.apiPath("v3"))
 	params := url.Values{}
 	params.Add("symbol", convertToBinanceSymbol(symbol))
 	params.Add("orderId", orderID)
