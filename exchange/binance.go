@@ -1725,55 +1725,100 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 	return tradingPairs, nil
 }
 
+// ScalpingConfig holds configuration for the scalping coin selection algorithm.
+type ScalpingConfig struct {
+	// Quote asset to filter pairs (default: "USDT")
+	QuoteAsset string
+	// Minimum 24h volume in USD (default: 20,000,000)
+	MinVolume float64
+	// Maximum spread percentage (default: 0.08%)
+	MaxSpread float64
+	// Minimum profitability ratio (default: 3.0)
+	MinProfitabilityRatio float64
+	// Minimum ATR percentage on 5-min candles (default: 0.3%)
+	MinATR5Min float64
+	// Minimum order book depth within 0.05% (default: $5,000)
+	MinOrderBookDepth float64
+	// Taker fee percentage (default: 0.1% for Binance)
+	TakerFeePercent float64
+	// Number of top coins to return (default: 5)
+	TopN int
+	// Rate limit delay between API calls (default: 100ms)
+	RateLimitDelay time.Duration
+}
+
+// DefaultScalpingConfig returns the recommended configuration for scalping coin selection.
+func DefaultScalpingConfig() ScalpingConfig {
+	return ScalpingConfig{
+		QuoteAsset:            "USDT",
+		MinVolume:             20_000_000, // $20M USD minimum
+		MaxSpread:             0.08,       // 0.08% maximum spread
+		MinProfitabilityRatio: 3.0,        // Profitability ratio > 3.0
+		MinATR5Min:            0.3,        // ATR > 0.3% on 5-min candles
+		MinOrderBookDepth:     5000,       // $5k fillable within 0.05%
+		TakerFeePercent:       0.1,        // 0.1% Binance taker fee
+		TopN:                  5,          // Top 5 coins for diversification
+		RateLimitDelay:        100 * time.Millisecond,
+	}
+}
+
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
-// OPTIMIZED VERSION: Uses batch ticker fetching, parallel processing, and two-phase analysis.
-// It uses an advanced multi-factor scoring algorithm that considers:
-//   - Volume: 24h trading volume (normalized, log scale)
-//   - Volatility: Daily price volatility from 1-minute candles (standard deviation of log returns)
-//   - Order book liquidity: Weighted depth analysis (orders closer to mid price weighted more)
-//   - Order book imbalance: Bid/ask ratio (slight preference for balanced books)
-//   - Price impact: Estimated slippage for typical scalping trade sizes
-//   - Spread: Bid-ask spread (strong penalty for wide spreads)
+// Uses an advanced multi-factor algorithm prioritizing spread over volume.
 //
-// The scoring formula: score = (volume^0.7 * volatility^0.8 * liquidity^0.6) / (spread^1.2 * impact^0.5 * imbalance^0.3)
+// Algorithm Priority:
+//  1. Spread filter: < 0.08% (primary filter - spread is more important than volume)
+//  2. Volume filter: > $20M USD (secondary filter for basic liquidity)
+//  3. Profitability ratio: Volatility / (Spread + 2×Fee) > 3.0
+//  4. ATR filter: > 0.3% on 5-minute candles (tradeable volatility)
+//  5. Order book depth: $5k fillable within 0.05% of mid-price
+//
+// Scoring Formula:
+//
+//	Score = (ATR_5min / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor
+//
+// Where DirectionalityFactor = Σ|returns| / (sign_changes + 1) rewards trending movement.
 //
 // Parameters:
-//   - quoteAsset: The quote currency to use (default: "USDT"). Must be a valid quote asset on Binance.
-//   - minVolume: Minimum 24h volume threshold in quote currency (default: 1000000)
-//   - topN: Number of top coins to return (default: 10)
+//   - quoteAsset: The quote currency to use (default: "USDT")
+//   - minVolume: Minimum 24h volume threshold in USD (default: 20,000,000)
+//   - topN: Number of top coins to return (default: 5)
 //   - rateLimitDelay: Delay between API calls to respect rate limits (default: 100ms)
-//   - maxSpread: Maximum allowed bid-ask spread percentage (default: 0.5). Coins with wider spreads are filtered out.
+//   - maxSpread: Maximum allowed bid-ask spread percentage (default: 0.08%)
 //
-// Returns a sorted list of ScalpingCoin structs, ranked by enhanced multi-factor score.
-// The algorithm prioritizes coins with high volume, good volatility, deep order books, tight spreads, and low slippage risk.
+// Returns a sorted list of ScalpingCoin structs, ranked by the advanced scoring algorithm.
 func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration, maxSpread float64) ([]ScalpingCoin, error) {
+	// Build config from parameters with smart defaults
+	config := DefaultScalpingConfig()
+
+	if quoteAsset != "" {
+		config.QuoteAsset = strings.ToUpper(quoteAsset)
+	}
+	if minVolume > 0 {
+		config.MinVolume = minVolume
+	}
+	if topN > 0 {
+		config.TopN = topN
+	}
+	if rateLimitDelay > 0 {
+		config.RateLimitDelay = rateLimitDelay
+	}
+	if maxSpread > 0 {
+		config.MaxSpread = maxSpread
+	}
+
+	return c.FindScalpingCoinsWithConfig(config)
+}
+
+// FindScalpingCoinsWithConfig performs scalping coin selection with full configuration control.
+// This method allows fine-tuning of all algorithm parameters.
+func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]ScalpingCoin, error) {
 	// Use a timeout context to prevent indefinite hanging
-	// Default timeout: 5 minutes (optimized version should be much faster)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Default values
-	if quoteAsset == "" {
-		quoteAsset = "USDT"
-	}
-	if minVolume <= 0 {
-		minVolume = 1000000 // Default: 1M in quote currency
-	}
-	if topN <= 0 {
-		topN = 10
-	}
-	if rateLimitDelay <= 0 {
-		rateLimitDelay = 100 * time.Millisecond
-	}
-	if maxSpread <= 0 {
-		maxSpread = 0.5 // Default: 0.5% maximum spread
-	}
-
-	quoteAsset = strings.ToUpper(quoteAsset)
 	logger := common.DefaultLogger()
 
-	// Get all trading pairs, filtering out Seed tokens (high-risk tokens with potential total loss)
-	// Seed tokens are not suitable for scalping due to their high volatility and risk of total loss
+	// Get all trading pairs, filtering out Seed tokens (high-risk tokens)
 	tradingPairs, err := c.GetTradingPairsWithFilter(true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get trading pairs: %w", err)
@@ -1781,9 +1826,9 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 
 	// Filter pairs by quote asset and build symbol map
 	candidatePairs := make([]common.TradingPair, 0)
-	symbolMap := make(map[string]common.TradingPair) // binanceSymbol -> TradingPair
+	symbolMap := make(map[string]common.TradingPair)
 	for _, pair := range tradingPairs {
-		if strings.EqualFold(pair.QuoteAsset, quoteAsset) {
+		if strings.EqualFold(pair.QuoteAsset, config.QuoteAsset) {
 			candidatePairs = append(candidatePairs, pair)
 			binanceSymbol := convertToBinanceSymbol(pair.Symbol)
 			symbolMap[binanceSymbol] = pair
@@ -1791,34 +1836,34 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 	}
 
 	if len(candidatePairs) == 0 {
-		return nil, fmt.Errorf("no trading pairs found for quote asset %s", quoteAsset)
+		return nil, fmt.Errorf("no trading pairs found for quote asset %s", config.QuoteAsset)
 	}
 
-	// PHASE 1: Batch fetch all 24h tickers in one API call (major optimization)
+	logger.Debugf("FindScalpingCoins: Found %d candidate pairs for %s", len(candidatePairs), config.QuoteAsset)
+
+	// PHASE 1: Batch fetch all 24h tickers in one API call
 	allTickers, err := c.getAllTickers24hr(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch all tickers: %w", err)
 	}
 
-	// Filter and score candidates using ticker data only
+	// Phase 1 filtering: Spread (primary) and Volume (secondary)
 	type candidateData struct {
-		pair        common.TradingPair
-		volume      float64
-		spread      float64
-		priceChange float64 // Use as volatility proxy
-		lastPrice   float64
-		bidPrice    float64
-		askPrice    float64
-		score       float64 // Preliminary score
+		pair      common.TradingPair
+		volume    float64
+		spread    float64
+		lastPrice float64
+		bidPrice  float64
+		askPrice  float64
 	}
 
 	candidates := make([]candidateData, 0)
-	var volumeFiltered, spreadFiltered int
+	var spreadFiltered, volumeFiltered int
 
 	for _, ticker := range allTickers {
 		pair, exists := symbolMap[ticker.Symbol]
 		if !exists {
-			continue // Not a candidate pair
+			continue
 		}
 
 		// Parse ticker values
@@ -1826,167 +1871,159 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 		lastPrice := ticker.parseLastPrice()
 		bidPrice := ticker.parseBidPrice()
 		askPrice := ticker.parseAskPrice()
-		priceChangePercent := ticker.parsePriceChangePercent()
 
 		// Validate basic price data
 		if lastPrice <= 0 || bidPrice <= 0 || askPrice <= 0 {
-			continue // Skip invalid price data
-		}
-
-		// Filter by minimum volume
-		if volume < minVolume {
-			volumeFiltered++
 			continue
 		}
-
-		// Calculate spread - ensure askPrice >= bidPrice for valid spread
-		var spread float64
-		if askPrice >= bidPrice {
-			midPrice := (bidPrice + askPrice) / 2
-			if midPrice > 0 {
-				spread = ((askPrice - bidPrice) / midPrice) * 100
-			}
-		} else {
-			// Invalid spread (ask < bid), skip this coin
-			continue
+		if askPrice < bidPrice {
+			continue // Invalid spread
 		}
 
-		// Filter by maximum spread
-		if spread > maxSpread {
+		// Calculate spread
+		midPrice := (bidPrice + askPrice) / 2
+		spread := ((askPrice - bidPrice) / midPrice) * 100
+
+		// PRIORITY 1: Filter by spread FIRST (most important for scalping)
+		// Spread directly impacts profitability
+		if spread > config.MaxSpread {
 			spreadFiltered++
 			continue
 		}
 
-		// Use priceChangePercent as volatility proxy (absolute value)
-		volatilityProxy := math.Abs(priceChangePercent)
-		if volatilityProxy <= 0 {
-			continue // Skip coins with no price movement
+		// PRIORITY 2: Filter by volume (secondary - ensures basic liquidity)
+		if volume < config.MinVolume {
+			volumeFiltered++
+			continue
 		}
 
-		// Preliminary score using ticker data only (without order book)
-		// This allows us to rank and only fetch expensive data for top candidates
-		preliminaryScore := calculateScalpingScore(volume, volatilityProxy, 1.0, 1.0, spread, 1.0)
-
 		candidates = append(candidates, candidateData{
-			pair:        pair,
-			volume:      volume,
-			spread:      spread,
-			priceChange: volatilityProxy,
-			lastPrice:   lastPrice,
-			bidPrice:    bidPrice,
-			askPrice:    askPrice,
-			score:       preliminaryScore,
+			pair:      pair,
+			volume:    volume,
+			spread:    spread,
+			lastPrice: lastPrice,
+			bidPrice:  bidPrice,
+			askPrice:  askPrice,
 		})
 	}
 
+	logger.Debugf("Phase 1: spreadFiltered=%d, volumeFiltered=%d, remaining=%d",
+		spreadFiltered, volumeFiltered, len(candidates))
+
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no candidates passed initial filters: volumeFiltered=%d, spreadFiltered=%d", volumeFiltered, spreadFiltered)
+		return nil, fmt.Errorf("no candidates passed initial filters: spreadFiltered=%d, volumeFiltered=%d",
+			spreadFiltered, volumeFiltered)
 	}
 
-	// Sort by preliminary score and take top candidates for detailed analysis
+	// Sort by spread (tightest spreads first) for priority in detailed analysis
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
+		return candidates[i].spread < candidates[j].spread
 	})
 
-	// Only analyze top 2*topN candidates in detail (to account for order book filtering)
-	// This optimization reduces API calls while ensuring we have enough candidates
-	// after detailed analysis filtering
-	detailedCandidates := candidates
-	maxDetailedCandidates := topN * 3 // Increased to 3x to account for filtering
+	// Limit candidates for detailed analysis
+	maxDetailedCandidates := config.TopN * 5
 	if len(candidates) > maxDetailedCandidates {
-		detailedCandidates = candidates[:maxDetailedCandidates]
+		candidates = candidates[:maxDetailedCandidates]
 	}
 
-	// PHASE 2: Parallel fetch detailed data (candles and order books) for top candidates
+	// PHASE 2: Detailed analysis with candles and order books
 	type detailedResult struct {
-		coin       ScalpingCoin
-		err        error
-		hasDetails bool
+		coin ScalpingCoin
+		err  error
 	}
 
-	resultChan := make(chan detailedResult, len(detailedCandidates))
-	semaphore := make(chan struct{}, 10) // Limit concurrent requests to 10
+	resultChan := make(chan detailedResult, len(candidates))
+	semaphore := make(chan struct{}, 10)
 
 	var wg sync.WaitGroup
-	since := time.Now().Add(-24 * time.Hour)
+	since5min := time.Now().Add(-6 * time.Hour) // 6 hours of 5-min candles
 
-	for i, cand := range detailedCandidates {
+	for i, cand := range candidates {
 		wg.Add(1)
 		go func(cand candidateData, index int) {
 			defer wg.Done()
 
-			// Respect rate limiting: stagger requests to avoid hitting rate limits
-			// Each goroutine waits a bit longer based on its index
+			// Rate limiting
 			if index > 0 {
-				delay := rateLimitDelay * time.Duration(index%10) // Stagger within batches of 10
+				delay := config.RateLimitDelay * time.Duration(index%10)
 				select {
 				case <-ctx.Done():
-					resultChan <- detailedResult{err: fmt.Errorf("context cancelled during rate limiting: %w", ctx.Err())}
+					resultChan <- detailedResult{err: ctx.Err()}
 					return
 				case <-time.After(delay):
-					// Continue after delay
 				}
 			}
 
-			semaphore <- struct{}{}        // Acquire semaphore
-			defer func() { <-semaphore }() // Release semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
 			symbol := cand.pair.Symbol
 
-			// Fetch candles for accurate volatility calculation
-			candles, err := c.GetCandles(symbol, "1m", since, 1440)
-			volatility := cand.priceChange // Default to price change if candles fail
-			if err == nil && len(candles) >= 2 {
-				volatility = calculateBinanceVolatility(candles)
-			}
-
-			if volatility <= 0 {
-				resultChan <- detailedResult{err: fmt.Errorf("invalid volatility")}
+			// Fetch 5-minute candles for ATR and directionality calculation
+			candles5min, err := c.GetCandles(symbol, "5m", since5min, 72) // 6 hours of 5-min candles
+			if err != nil || len(candles5min) < 10 {
+				resultChan <- detailedResult{err: fmt.Errorf("insufficient candle data")}
 				return
 			}
 
-			// Fetch order book for liquidity analysis
-			orderBook, err := c.GetOrderBook(symbol, 20)
-			liquidityScore, orderBookImbalance, priceImpactFactor := 1.0, 1.0, 1.0
-			hasOrderBook := false
-			if err == nil && orderBook != nil {
-				hasOrderBook = true
-				// Use the most accurate mid price available
-				midPrice := cand.lastPrice
-				if midPrice <= 0 {
-					// Fallback to bid/ask average if lastPrice is invalid
-					if cand.bidPrice > 0 && cand.askPrice > 0 && cand.askPrice >= cand.bidPrice {
-						midPrice = (cand.bidPrice + cand.askPrice) / 2
-					}
-				}
-				if midPrice > 0 {
-					liquidityScore = calculateOrderBookLiquidity(orderBook, midPrice)
-					orderBookImbalance = calculateOrderBookImbalance(orderBook)
-					priceImpactFactor = calculatePriceImpactFactor(orderBook, midPrice)
-				}
+			// Calculate ATR on 5-minute candles
+			atr5min := calculateATR5Min(candles5min)
+			if atr5min < config.MinATR5Min {
+				resultChan <- detailedResult{err: fmt.Errorf("ATR too low: %.4f%% < %.4f%%", atr5min, config.MinATR5Min)}
+				return
 			}
 
-			// Calculate final score with all factors
-			finalScore := calculateScalpingScore(cand.volume, volatility, liquidityScore, orderBookImbalance, cand.spread, priceImpactFactor)
+			// Calculate directionality factor
+			directionalityFactor := calculateDirectionalityFactor(candles5min)
+
+			// Calculate profitability ratio
+			profitabilityRatio := calculateProfitabilityRatio(atr5min, cand.spread, config.TakerFeePercent)
+			if profitabilityRatio < config.MinProfitabilityRatio {
+				resultChan <- detailedResult{err: fmt.Errorf("profitability ratio too low: %.2f < %.2f",
+					profitabilityRatio, config.MinProfitabilityRatio)}
+				return
+			}
+
+			// Fetch order book for depth check
+			orderBook, err := c.GetOrderBook(symbol, 100)
+			var orderBookDepth float64
+			if err == nil && orderBook != nil {
+				midPrice := (cand.bidPrice + cand.askPrice) / 2
+				// Check depth within 0.05% of mid-price
+				orderBookDepth = calculateOrderBookDepthWithinSpread(orderBook, midPrice, 0.05)
+			}
+
+			// Filter by order book depth
+			if orderBookDepth < config.MinOrderBookDepth {
+				resultChan <- detailedResult{err: fmt.Errorf("order book depth too low: $%.2f < $%.2f",
+					orderBookDepth, config.MinOrderBookDepth)}
+				return
+			}
+
+			// Calculate advanced score using the new formula
+			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor)
+
+			// Also calculate legacy volatility for backward compatibility
+			volatility := calculateBinanceVolatility(candles5min)
 
 			coin := ScalpingCoin{
-				Code:       cand.pair.BaseAsset,
-				Name:       cand.pair.BaseAsset,
-				Symbol:     symbol,
-				Volume:     cand.volume,
-				Volatility: volatility,
-				Spread:     cand.spread,
-				Score:      finalScore,
+				Code:                 cand.pair.BaseAsset,
+				Name:                 cand.pair.BaseAsset,
+				Symbol:               symbol,
+				Volume:               cand.volume,
+				Volatility:           volatility,
+				Spread:               cand.spread,
+				Score:                score,
+				ATR5Min:              atr5min,
+				ProfitabilityRatio:   profitabilityRatio,
+				DirectionalityFactor: directionalityFactor,
+				OrderBookDepth:       orderBookDepth,
 			}
 
-			resultChan <- detailedResult{
-				coin:       coin,
-				hasDetails: hasOrderBook,
-			}
+			resultChan <- detailedResult{coin: coin}
 		}(cand, i)
 	}
 
-	// Close channel when all goroutines complete
 	go func() {
 		wg.Wait()
 		close(resultChan)
@@ -1994,40 +2031,42 @@ func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, 
 
 	// Collect results
 	rankedCoins := make([]ScalpingCoin, 0)
-	var candlesFetched, orderBooksFetched, volatilityFiltered int
+	var atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered int
 
 	for result := range resultChan {
 		if result.err != nil {
+			errStr := result.err.Error()
+			if strings.Contains(errStr, "ATR too low") {
+				atrFiltered++
+			} else if strings.Contains(errStr, "profitability ratio") {
+				profitabilityFiltered++
+			} else if strings.Contains(errStr, "order book depth") {
+				depthFiltered++
+			} else {
+				otherFiltered++
+			}
 			continue
 		}
-		if result.coin.Volatility <= 0 {
-			volatilityFiltered++
-			continue
-		}
-		if result.hasDetails {
-			orderBooksFetched++
-		}
-		candlesFetched++
 		rankedCoins = append(rankedCoins, result.coin)
 	}
 
-	// Sort by final score
+	// Sort by score (highest first)
 	sort.Slice(rankedCoins, func(i, j int) bool {
 		return rankedCoins[i].Score > rankedCoins[j].Score
 	})
 
 	// Debug logging
-	logger.Debugf("FindScalpingCoins (optimized): candidatePairs=%d, tickersBatch=1, candlesFetched=%d, orderBooksFetched=%d, volumeFiltered=%d, spreadFiltered=%d, volatilityFiltered=%d, ranked=%d",
-		len(candidatePairs), candlesFetched, orderBooksFetched, volumeFiltered, spreadFiltered, volatilityFiltered, len(rankedCoins))
+	logger.Debugf("FindScalpingCoins: candidates=%d, spreadFiltered=%d, volumeFiltered=%d, atrFiltered=%d, profitabilityFiltered=%d, depthFiltered=%d, otherFiltered=%d, ranked=%d",
+		len(candidatePairs), spreadFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered, len(rankedCoins))
 
-	// If no coins meet criteria, return error
 	if len(rankedCoins) == 0 {
-		return nil, fmt.Errorf("no coins passed all filters after detailed analysis")
+		return nil, fmt.Errorf("no coins passed all filters (spread: %d, volume: %d, ATR: %d, profitability: %d, depth: %d, other: %d)",
+			spreadFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered)
 	}
 
 	// Return top N
-	if len(rankedCoins) > topN {
-		rankedCoins = rankedCoins[:topN]
+	if len(rankedCoins) > config.TopN {
+		rankedCoins = rankedCoins[:config.TopN]
 	}
 
 	return rankedCoins, nil
@@ -2393,6 +2432,189 @@ func calculateScalpingScore(volume, volatility, liquidityScore, orderBookImbalan
 
 	// Scale to a reasonable range (0.1 to 1000)
 	// This ensures scores are comparable across different market conditions
+	return score
+}
+
+// calculateATR5Min calculates the Average True Range on 5-minute candles as a percentage.
+// ATR measures volatility by considering the full price range within each period.
+// Returns ATR as a percentage of the current price.
+func calculateATR5Min(candles []models.Candle) float64 {
+	if len(candles) < 2 {
+		return 0
+	}
+
+	var trueRanges []float64
+
+	for i := 1; i < len(candles); i++ {
+		high := candles[i].High
+		low := candles[i].Low
+		prevClose := candles[i-1].Close
+
+		if high <= 0 || low <= 0 || prevClose <= 0 {
+			continue
+		}
+
+		// True Range = max(High - Low, |High - PrevClose|, |Low - PrevClose|)
+		tr1 := high - low
+		tr2 := math.Abs(high - prevClose)
+		tr3 := math.Abs(low - prevClose)
+
+		tr := tr1
+		if tr2 > tr {
+			tr = tr2
+		}
+		if tr3 > tr {
+			tr = tr3
+		}
+
+		trueRanges = append(trueRanges, tr)
+	}
+
+	if len(trueRanges) == 0 {
+		return 0
+	}
+
+	// Calculate average true range
+	var sum float64
+	for _, tr := range trueRanges {
+		sum += tr
+	}
+	atr := sum / float64(len(trueRanges))
+
+	// Convert to percentage based on the latest close price
+	lastClose := candles[len(candles)-1].Close
+	if lastClose <= 0 {
+		return 0
+	}
+
+	atrPercent := (atr / lastClose) * 100
+	return atrPercent
+}
+
+// calculateDirectionalityFactor measures how "trendy" vs "choppy" the price action is.
+// Formula: Σ|returns| / (count of sign changes + 1)
+// Higher values indicate more sustained directional movement (better for scalping).
+func calculateDirectionalityFactor(candles []models.Candle) float64 {
+	if len(candles) < 3 {
+		return 1.0 // Neutral factor
+	}
+
+	// Calculate returns
+	var returns []float64
+	var sumAbsReturns float64
+
+	for i := 1; i < len(candles); i++ {
+		if candles[i-1].Close <= 0 || candles[i].Close <= 0 {
+			continue
+		}
+		ret := (candles[i].Close - candles[i-1].Close) / candles[i-1].Close
+		returns = append(returns, ret)
+		sumAbsReturns += math.Abs(ret)
+	}
+
+	if len(returns) < 2 {
+		return 1.0
+	}
+
+	// Count sign changes (direction reversals)
+	var signChanges int
+	for i := 1; i < len(returns); i++ {
+		// Sign change if returns have opposite signs
+		if (returns[i] > 0 && returns[i-1] < 0) || (returns[i] < 0 && returns[i-1] > 0) {
+			signChanges++
+		}
+	}
+
+	// Directionality = sum of absolute returns / (sign changes + 1)
+	// +1 to avoid division by zero and to scale appropriately
+	directionality := sumAbsReturns / float64(signChanges+1)
+
+	// Scale to a reasonable range (typically 0.001 to 0.1)
+	// Multiply by 100 to get a more usable range
+	return directionality * 100
+}
+
+// calculateProfitabilityRatio calculates the profitability ratio for scalping.
+// Formula: Volatility / (Spread + 2 × TakerFee)
+// Minimum threshold should be > 3.0 for profitable scalping.
+func calculateProfitabilityRatio(volatility, spread, takerFeePercent float64) float64 {
+	if spread <= 0 {
+		spread = 0.001 // Avoid division by zero
+	}
+
+	totalCost := spread + (2.0 * takerFeePercent)
+	if totalCost <= 0 {
+		return 0
+	}
+
+	return volatility / totalCost
+}
+
+// calculateOrderBookDepthWithinSpread calculates the total fillable USD value
+// within a specified percentage of the mid-price on each side of the order book.
+// Returns the minimum of bid-side and ask-side depth (to ensure both directions are tradeable).
+func calculateOrderBookDepthWithinSpread(orderBook *models.OrderBook, midPrice float64, spreadPercent float64) float64 {
+	if orderBook == nil || midPrice <= 0 || spreadPercent <= 0 {
+		return 0
+	}
+
+	// Calculate price thresholds
+	maxBidPrice := midPrice * (1 - spreadPercent/100)
+	minAskPrice := midPrice * (1 + spreadPercent/100)
+
+	var bidDepth, askDepth float64
+
+	// Sum bid-side depth within threshold
+	for _, bid := range orderBook.Bids {
+		if bid.Price >= maxBidPrice && bid.Price > 0 && bid.Amount > 0 {
+			bidDepth += bid.Price * bid.Amount
+		}
+	}
+
+	// Sum ask-side depth within threshold
+	for _, ask := range orderBook.Asks {
+		if ask.Price <= minAskPrice && ask.Price > 0 && ask.Amount > 0 {
+			askDepth += ask.Price * ask.Amount
+		}
+	}
+
+	// Return minimum of both sides (both must have sufficient depth)
+	if bidDepth < askDepth {
+		return bidDepth
+	}
+	return askDepth
+}
+
+// calculateAdvancedScalpingScore computes the advanced scoring algorithm for scalping suitability.
+// Formula: Score = (ATR_5min / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor
+// This scoring method prioritizes:
+//   - ATR/Spread ratio: How much price moves relative to cost of trading
+//   - Volume factor: Ensures sufficient liquidity (sqrt to reduce impact of very high volume)
+//   - Directionality: Rewards trending movement over choppy action
+func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFactor float64) float64 {
+	if spread <= 0 {
+		spread = 0.001 // Avoid division by zero
+	}
+
+	// ATR/Spread ratio - core profitability metric
+	atrSpreadRatio := atr5min / spread
+
+	// Volume factor: sqrt(Volume / 10M)
+	// This normalizes volume impact and ensures basic liquidity
+	volumeFactor := math.Sqrt(volume24h / 10_000_000)
+	if volumeFactor < 0.1 {
+		volumeFactor = 0.1 // Minimum volume factor
+	}
+	if volumeFactor > 10.0 {
+		volumeFactor = 10.0 // Cap volume factor to prevent domination
+	}
+
+	// Directionality factor (already scaled appropriately)
+	if directionalityFactor <= 0 {
+		directionalityFactor = 1.0
+	}
+
+	score := atrSpreadRatio * volumeFactor * directionalityFactor
 	return score
 }
 

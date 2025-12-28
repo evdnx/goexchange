@@ -533,6 +533,12 @@ type ScalpingCoin struct {
 	Volatility float64 // Daily volatility percentage (std dev of log returns)
 	Spread     float64 // Bid-ask spread percentage ((ask - bid) / mid * 100)
 	Score      float64 // Ranking score (volume * volatility / spread_factor)
+
+	// Enhanced scalping metrics (Binance only for now)
+	ATR5Min              float64 // Average True Range on 5-minute candles (as percentage)
+	ProfitabilityRatio   float64 // Volatility / (Spread + 2 × TakerFee) - min threshold 3.0
+	DirectionalityFactor float64 // Rewards trending movement: Σ|returns| / (sign changes)
+	OrderBookDepth       float64 // Fillable USD within 0.05% of mid-price (per side)
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.

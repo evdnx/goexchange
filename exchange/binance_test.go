@@ -129,12 +129,14 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 
 	// Create Binance client (no API keys needed for public endpoints)
 	client := NewBinanceClient("", "", false, nil)
+
+	// Test with legacy API (using default config values internally)
 	coins, err := client.FindScalpingCoins(
 		"USDT",               // quoteAsset
-		1000000,              // minVolume: 1M USDT
-		10,                   // topN: top 10 coins
+		20_000_000,           // minVolume: $20M USD (new default)
+		5,                    // topN: top 5 coins for diversification
 		100*time.Millisecond, // rateLimitDelay
-		0.5,                  // maxSpread: 0.5%
+		0.08,                 // maxSpread: 0.08% (new stricter default)
 	)
 
 	if err != nil {
@@ -145,10 +147,11 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 		t.Fatal("expected at least one scalping coin, got 0")
 	}
 
-	// Log summary
+	// Log summary with enhanced metrics
 	t.Logf("Found %d scalping coins", len(coins))
-	if len(coins) > 0 {
-		t.Logf("Top coin: %s (%s) - Score: %.4f", coins[0].Code, coins[0].Symbol, coins[0].Score)
+	for i, coin := range coins {
+		t.Logf("  %d. %s (%s) - Score: %.4f, ATR5Min: %.4f%%, Spread: %.4f%%, Profitability: %.2f, Directionality: %.4f, Depth: $%.2f",
+			i+1, coin.Code, coin.Symbol, coin.Score, coin.ATR5Min, coin.Spread, coin.ProfitabilityRatio, coin.DirectionalityFactor, coin.OrderBookDepth)
 	}
 
 	// Validate results
@@ -160,6 +163,48 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 	}
 	if coins[0].Score <= 0 {
 		t.Error("expected positive score for first coin")
+	}
+
+	// Validate new metrics
+	if coins[0].ATR5Min <= 0 {
+		t.Error("expected positive ATR5Min for first coin")
+	}
+	if coins[0].ProfitabilityRatio < 3.0 {
+		t.Errorf("expected profitability ratio >= 3.0, got %.2f", coins[0].ProfitabilityRatio)
+	}
+	if coins[0].DirectionalityFactor <= 0 {
+		t.Error("expected positive directionality factor for first coin")
+	}
+	if coins[0].OrderBookDepth < 5000 {
+		t.Errorf("expected order book depth >= $5000, got $%.2f", coins[0].OrderBookDepth)
+	}
+}
+
+// TestBinanceFindScalpingCoinsWithConfig tests the new config-based API
+func TestBinanceFindScalpingCoinsWithConfig(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Binance call in short mode")
+	}
+
+	client := NewBinanceClient("", "", false, nil)
+
+	// Use custom config with relaxed thresholds for testing
+	config := DefaultScalpingConfig()
+	config.MinVolume = 10_000_000      // Lower volume threshold
+	config.MaxSpread = 0.15            // More lenient spread
+	config.MinProfitabilityRatio = 2.0 // Lower profitability threshold
+	config.MinATR5Min = 0.2            // Lower ATR threshold
+	config.MinOrderBookDepth = 2000    // Lower depth requirement
+	config.TopN = 10
+
+	coins, err := client.FindScalpingCoinsWithConfig(config)
+	if err != nil {
+		t.Fatalf("failed to find scalping coins with config: %v", err)
+	}
+
+	t.Logf("Found %d coins with relaxed config", len(coins))
+	if len(coins) > 0 {
+		t.Logf("Top coin: %s - Score: %.4f", coins[0].Code, coins[0].Score)
 	}
 }
 
