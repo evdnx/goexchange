@@ -1745,9 +1745,14 @@ type ScalpingConfig struct {
 	TopN int
 	// Rate limit delay between API calls (default: 100ms)
 	RateLimitDelay time.Duration
+	// VolatilityWeight controls how much emphasis is placed on volatility (ATR) in scoring.
+	// Higher values favor more volatile coins. (default: 1.5 for high-volatility targeting)
+	// Use 1.0 for balanced scoring, 2.0+ for aggressive volatility preference.
+	VolatilityWeight float64
 }
 
 // DefaultScalpingConfig returns the recommended configuration for scalping coin selection.
+// By default, volatility weight is set to 1.5 to favor higher-volatility coins.
 func DefaultScalpingConfig() ScalpingConfig {
 	return ScalpingConfig{
 		QuoteAsset:            "USDT",
@@ -1759,6 +1764,7 @@ func DefaultScalpingConfig() ScalpingConfig {
 		TakerFeePercent:       0.1,        // 0.1% Binance taker fee
 		TopN:                  5,          // Top 5 coins for diversification
 		RateLimitDelay:        100 * time.Millisecond,
+		VolatilityWeight:      1.5, // Favor high-volatility coins (1.0 = balanced, 2.0+ = aggressive)
 	}
 }
 
@@ -2000,8 +2006,8 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				return
 			}
 
-			// Calculate advanced score using the new formula
-			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor)
+			// Calculate advanced score using the new formula with volatility weighting
+			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor, config.VolatilityWeight)
 
 			// Also calculate legacy volatility for backward compatibility
 			volatility := calculateBinanceVolatility(candles5min)
@@ -2586,18 +2592,29 @@ func calculateOrderBookDepthWithinSpread(orderBook *models.OrderBook, midPrice f
 }
 
 // calculateAdvancedScalpingScore computes the advanced scoring algorithm for scalping suitability.
-// Formula: Score = (ATR_5min / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor
+// Formula: Score = (ATR_5min^volatilityWeight / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor
 // This scoring method prioritizes:
 //   - ATR/Spread ratio: How much price moves relative to cost of trading
+//   - Volatility weight: Raises ATR to a power to favor higher-volatility coins
 //   - Volume factor: Ensures sufficient liquidity (sqrt to reduce impact of very high volume)
 //   - Directionality: Rewards trending movement over choppy action
-func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFactor float64) float64 {
+func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFactor, volatilityWeight float64) float64 {
 	if spread <= 0 {
 		spread = 0.001 // Avoid division by zero
 	}
 
-	// ATR/Spread ratio - core profitability metric
-	atrSpreadRatio := atr5min / spread
+	// Apply volatility weight: raise ATR to the power of volatilityWeight
+	// volatilityWeight > 1.0 emphasizes high-volatility coins more strongly
+	// volatilityWeight = 1.0 is the original balanced scoring
+	// volatilityWeight = 1.5 gives 50% more emphasis to volatility
+	// volatilityWeight = 2.0 squares the ATR effect, strongly favoring volatile coins
+	if volatilityWeight <= 0 {
+		volatilityWeight = 1.0
+	}
+	weightedATR := math.Pow(atr5min, volatilityWeight)
+
+	// Weighted ATR/Spread ratio - core profitability metric with volatility emphasis
+	atrSpreadRatio := weightedATR / spread
 
 	// Volume factor: sqrt(Volume / 10M)
 	// This normalizes volume impact and ensures basic liquidity
