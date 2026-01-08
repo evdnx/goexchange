@@ -208,3 +208,123 @@ func TestBinanceFindScalpingCoinsWithConfig(t *testing.T) {
 		t.Logf("Top coin: %s - Score: %.4f", coins[0].Code, coins[0].Score)
 	}
 }
+
+// TestBinanceGetSpotPositions tests getting spot positions from Binance demo account
+//
+// IMPORTANT: This test requires DEMO API keys, which are different from production keys.
+// To set up demo API keys:
+//  1. Visit https://demo.binance.com/en/my/settings/api-management
+//  2. Create API keys in the demo API Management section
+//  3. Enable "READ" permission in API Management (required to read account info)
+//  4. Set BINANCE_API_KEY and BINANCE_API_SECRET environment variables
+//
+// Note: Demo environment uses https://demo-api.binance.com/api endpoint (no GitHub login required)
+func TestBinanceGetSpotPositions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live Binance call in short mode")
+	}
+
+	// NewBinanceClient will automatically read from environment variables if empty strings are passed
+	// (BINANCE_API_KEY and BINANCE_API_SECRET from .env file or environment)
+	// The third parameter (true) enables testnet/demo mode, which uses https://demo-api.binance.com/api
+	client := NewBinanceClient("", "", true, nil)
+
+	// Verify credentials were loaded - fail if not set (don't skip, as this indicates a configuration issue)
+	apiKey := client.APIKey()
+	apiSecret := client.APISecret()
+	if apiKey == "" {
+		t.Fatalf("BINANCE_API_KEY is not set - check .env file or environment variables")
+	}
+	if apiSecret == "" {
+		t.Fatalf("BINANCE_API_SECRET is not set - check .env file or environment variables")
+	}
+
+	// Log first few characters of API key for verification (truncated for security)
+	keyPreview := apiKey
+	if len(apiKey) > 8 {
+		keyPreview = apiKey[:8]
+	}
+	t.Logf("Using API key: %s... (truncated for security)", keyPreview)
+	t.Logf("Using demo endpoint: https://demo-api.binance.com/api")
+	t.Logf("NOTE: This test requires DEMO API keys created at https://demo.binance.com/en/my/settings/api-management")
+	t.Logf("      Demo keys are separate from production keys (no GitHub login required).")
+	t.Logf("      READ permission must be enabled in demo API Management.")
+
+	// Get spot positions from demo account
+	positions, err := client.GetSpotPositions()
+	if err != nil {
+		// Provide helpful error message for common authentication issues
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "Invalid API-key") || strings.Contains(errMsg, "authentication_failed") {
+			t.Fatalf("Authentication failed - possible causes:\n"+
+				"  1. Using production API keys with demo (demo keys must be created separately)\n"+
+				"  2. API key doesn't have 'READ' permission enabled\n"+
+				"  3. Demo API keys not created at https://demo.binance.com/en/my/settings/api-management\n"+
+				"  4. IP whitelisting is enabled and your IP is not whitelisted\n"+
+				"  5. Incorrect API key or secret\n"+
+				"\n"+
+				"  Setup instructions:\n"+
+				"  - Visit https://demo.binance.com/en/my/settings/api-management\n"+
+				"  - Create API keys in the demo API Management section\n"+
+				"  - Enable 'READ' permission in API Management\n"+
+				"  - Set BINANCE_API_KEY and BINANCE_API_SECRET environment variables\n"+
+				"\n"+
+				"  Error: %v", err)
+		}
+		t.Fatalf("failed to get spot positions: %v", err)
+	}
+
+	// Validate response
+	if positions == nil {
+		t.Fatal("expected non-nil positions slice")
+	}
+
+	t.Logf("Found %d spot positions (excluding dust)", len(positions))
+
+	// Validate each position
+	for i, pos := range positions {
+		if pos.Asset == "" {
+			t.Errorf("position %d: expected non-empty asset", i)
+		}
+
+		if pos.Total <= 0 {
+			t.Errorf("position %d (%s): expected positive total balance, got %f", i, pos.Asset, pos.Total)
+		}
+
+		if pos.Free < 0 {
+			t.Errorf("position %d (%s): expected non-negative free balance, got %f", i, pos.Asset, pos.Free)
+		}
+
+		if pos.Locked < 0 {
+			t.Errorf("position %d (%s): expected non-negative locked balance, got %f", i, pos.Asset, pos.Locked)
+		}
+
+		// Verify that free + locked equals total (within floating point precision)
+		expectedTotal := pos.Free + pos.Locked
+		if abs(pos.Total-expectedTotal) > 0.00000001 {
+			t.Errorf("position %d (%s): total (%f) should equal free (%f) + locked (%f)", i, pos.Asset, pos.Total, pos.Free, pos.Locked)
+		}
+
+		// Verify that dust positions are excluded
+		if pos.IsDust {
+			t.Errorf("position %d (%s): dust positions should be excluded, but IsDust is true", i, pos.Asset)
+		}
+
+		// Log position details
+		t.Logf("  Position %d: %s - Total: %f, Free: %f, Locked: %f, Tradeable: %v",
+			i+1, pos.Asset, pos.Total, pos.Free, pos.Locked, pos.IsTradeable)
+	}
+
+	// Note: It's valid to have zero positions if the demo account has no balances above dust threshold
+	if len(positions) == 0 {
+		t.Logf("No spot positions found (account may have zero balances or only dust)")
+	}
+}
+
+// abs returns the absolute value of a float64
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
