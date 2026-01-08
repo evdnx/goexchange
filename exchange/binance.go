@@ -113,6 +113,16 @@ type FuturesPosition struct {
 	UpdateTime       time.Time
 }
 
+// SpotPosition represents a spot trading position (non-zero balance)
+type SpotPosition struct {
+	Asset       string  // Asset symbol (e.g., "BTC", "ETH")
+	Free        float64 // Available balance for trading
+	Locked      float64 // Locked balance (in orders, etc.)
+	Total       float64 // Total balance (Free + Locked)
+	IsDust      bool    // Whether this is considered dust (very small amount)
+	IsTradeable bool    // Whether this asset can be traded
+}
+
 const (
 	StreamTicker     BinanceStreamType = "ticker"
 	StreamKline      BinanceStreamType = "kline"
@@ -1155,6 +1165,94 @@ func (c *BinanceClient) GetBalances() (map[string]*common.Balance, error) {
 	}
 
 	return balances, nil
+}
+
+// GetSpotPositions returns all open spot positions, excluding dust and non-tradeable positions
+func (c *BinanceClient) GetSpotPositions() ([]SpotPosition, error) {
+	// Get all balances
+	balances, err := c.GetBalances()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get balances: %w", err)
+	}
+
+	// Get tradeable assets from exchange info
+	tradingPairs, err := c.GetTradingPairs()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trading pairs: %w", err)
+	}
+
+	// Create set of tradeable assets
+	tradeableAssets := make(map[string]bool)
+	for _, pair := range tradingPairs {
+		tradeableAssets[pair.BaseAsset] = true
+		tradeableAssets[pair.QuoteAsset] = true
+	}
+
+	var positions []SpotPosition
+
+	for asset, balance := range balances {
+		// Parse free and locked amounts
+		free, err := strconv.ParseFloat(balance.Free, 64)
+		if err != nil {
+			continue // Skip invalid balances
+		}
+
+		locked, err := strconv.ParseFloat(balance.Locked, 64)
+		if err != nil {
+			continue // Skip invalid balances
+		}
+
+		total := free + locked
+
+		// Skip zero balances
+		if total == 0 {
+			continue
+		}
+
+		// Check if this is dust (very small amount)
+		isDust := c.isDustPosition(asset, total)
+
+		// Check if asset is tradeable
+		isTradeable := tradeableAssets[asset]
+
+		position := SpotPosition{
+			Asset:       asset,
+			Free:        free,
+			Locked:      locked,
+			Total:       total,
+			IsDust:      isDust,
+			IsTradeable: isTradeable,
+		}
+
+		// Only include non-dust positions (user wants to exclude dust and non-tradeable)
+		if !isDust {
+			positions = append(positions, position)
+		}
+	}
+
+	return positions, nil
+}
+
+// isDustPosition determines if a position is considered dust based on asset type and amount
+func (c *BinanceClient) isDustPosition(asset string, amount float64) bool {
+	// Define dust thresholds for different asset types
+	// These are approximate minimum tradeable amounts for Binance
+	dustThresholds := map[string]float64{
+		"BTC":  0.00001, // ~$0.50 at $50k BTC
+		"ETH":  0.0001,  // ~$0.03 at $300 ETH
+		"BNB":  0.001,   // ~$0.30 at $300 BNB
+		"USDT": 1.0,     // $1 minimum
+		"USDC": 1.0,     // $1 minimum
+		"BUSD": 1.0,     // $1 minimum
+	}
+
+	// For assets not in the map, use a very small threshold
+	threshold, exists := dustThresholds[asset]
+	if !exists {
+		threshold = 0.00000001 // Very small amount for unknown assets
+	}
+
+	return amount < threshold
 }
 
 // GetOpenOrders retrieves all open orders for a symbol
