@@ -539,6 +539,8 @@ type ScalpingCoin struct {
 	ProfitabilityRatio   float64 // Volatility / (Spread + 2 × TakerFee) - min threshold 3.0
 	DirectionalityFactor float64 // Rewards trending movement: Σ|returns| / (sign changes)
 	OrderBookDepth       float64 // Fillable USD within 0.05% of mid-price (per side)
+	TradesPerMinute      float64 // 24h trades per minute (higher = faster execution/liquidity)
+	ExitLiquidityScore   float64 // Multiplier favoring pairs with deep/active books for quick exits
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.

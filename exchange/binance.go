@@ -1829,6 +1829,8 @@ type ScalpingConfig struct {
 	QuoteAsset string
 	// Minimum 24h volume in USD (default: 20,000,000)
 	MinVolume float64
+	// Minimum trades per minute over the last 24h to ensure active markets (default: 10)
+	MinTradesPerMin float64
 	// Maximum spread percentage (default: 0.08%)
 	MaxSpread float64
 	// Minimum profitability ratio (default: 3.0)
@@ -1855,6 +1857,7 @@ func DefaultScalpingConfig() ScalpingConfig {
 	return ScalpingConfig{
 		QuoteAsset:            "USDT",
 		MinVolume:             20_000_000, // $20M USD minimum
+		MinTradesPerMin:       10,         // At least 10 trades/min for fast exits
 		MaxSpread:             0.08,       // 0.08% maximum spread
 		MinProfitabilityRatio: 3.0,        // Profitability ratio > 3.0
 		MinATR5Min:            0.3,        // ATR > 0.3% on 5-min candles
@@ -1872,9 +1875,10 @@ func DefaultScalpingConfig() ScalpingConfig {
 // Algorithm Priority:
 //  1. Spread filter: < 0.08% (primary filter - spread is more important than volume)
 //  2. Volume filter: > $20M USD (secondary filter for basic liquidity)
-//  3. Profitability ratio: Volatility / (Spread + 2×Fee) > 3.0
-//  4. ATR filter: > 0.3% on 5-minute candles (tradeable volatility)
-//  5. Order book depth: $5k fillable within 0.05% of mid-price
+//  3. Trade frequency filter: > 10 trades/min (ensures continuous flow to exit quickly)
+//  4. Profitability ratio: Volatility / (Spread + 2×Fee) > 3.0
+//  5. ATR filter: > 0.3% on 5-minute candles (tradeable volatility)
+//  6. Order book depth: $5k fillable within 0.05% of mid-price
 //
 // Scoring Formula:
 //
@@ -1888,6 +1892,7 @@ func DefaultScalpingConfig() ScalpingConfig {
 //   - topN: Number of top coins to return (default: 5)
 //   - rateLimitDelay: Delay between API calls to respect rate limits (default: 100ms)
 //   - maxSpread: Maximum allowed bid-ask spread percentage (default: 0.08%)
+//   - trade frequency: Controlled via config.MinTradesPerMin (default: 10 trades/min)
 //
 // Returns a sorted list of ScalpingCoin structs, ranked by the advanced scoring algorithm.
 func (c *BinanceClient) FindScalpingCoins(quoteAsset string, minVolume float64, topN int, rateLimitDelay time.Duration, maxSpread float64) ([]ScalpingCoin, error) {
@@ -1951,18 +1956,19 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 		return nil, fmt.Errorf("failed to fetch all tickers: %w", err)
 	}
 
-	// Phase 1 filtering: Spread (primary) and Volume (secondary)
+	// Phase 1 filtering: Spread (primary), Trade frequency (secondary), Volume (tertiary)
 	type candidateData struct {
-		pair      common.TradingPair
-		volume    float64
-		spread    float64
-		lastPrice float64
-		bidPrice  float64
-		askPrice  float64
+		pair         common.TradingPair
+		volume       float64
+		tradesPerMin float64
+		spread       float64
+		lastPrice    float64
+		bidPrice     float64
+		askPrice     float64
 	}
 
 	candidates := make([]candidateData, 0)
-	var spreadFiltered, volumeFiltered int
+	var spreadFiltered, volumeFiltered, tradeFiltered int
 
 	for _, ticker := range allTickers {
 		pair, exists := symbolMap[ticker.Symbol]
@@ -1972,6 +1978,7 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 
 		// Parse ticker values
 		volume := ticker.parseVolume()
+		tradesPerMin := ticker.tradesPerMinute()
 		lastPrice := ticker.parseLastPrice()
 		bidPrice := ticker.parseBidPrice()
 		askPrice := ticker.parseAskPrice()
@@ -1995,28 +2002,35 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 			continue
 		}
 
-		// PRIORITY 2: Filter by volume (secondary - ensures basic liquidity)
+		// PRIORITY 2: Filter by trade frequency (fast fills)
+		if tradesPerMin < config.MinTradesPerMin {
+			tradeFiltered++
+			continue
+		}
+
+		// PRIORITY 3: Filter by volume (ensures basic liquidity)
 		if volume < config.MinVolume {
 			volumeFiltered++
 			continue
 		}
 
 		candidates = append(candidates, candidateData{
-			pair:      pair,
-			volume:    volume,
-			spread:    spread,
-			lastPrice: lastPrice,
-			bidPrice:  bidPrice,
-			askPrice:  askPrice,
+			pair:         pair,
+			volume:       volume,
+			tradesPerMin: tradesPerMin,
+			spread:       spread,
+			lastPrice:    lastPrice,
+			bidPrice:     bidPrice,
+			askPrice:     askPrice,
 		})
 	}
 
-	logger.Debugf("Phase 1: spreadFiltered=%d, volumeFiltered=%d, remaining=%d",
-		spreadFiltered, volumeFiltered, len(candidates))
+	logger.Debugf("Phase 1: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, remaining=%d",
+		spreadFiltered, tradeFiltered, volumeFiltered, len(candidates))
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no candidates passed initial filters: spreadFiltered=%d, volumeFiltered=%d",
-			spreadFiltered, volumeFiltered)
+		return nil, fmt.Errorf("no candidates passed initial filters: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d",
+			spreadFiltered, tradeFiltered, volumeFiltered)
 	}
 
 	// Sort by spread (tightest spreads first) for priority in detailed analysis
@@ -2104,8 +2118,10 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				return
 			}
 
+			exitSpeed := calculateExitSpeedFactor(orderBookDepth, cand.tradesPerMin, config.MinOrderBookDepth)
+
 			// Calculate advanced score using the new formula with volatility weighting
-			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor, config.VolatilityWeight)
+			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor, config.VolatilityWeight, exitSpeed)
 
 			// Also calculate legacy volatility for backward compatibility
 			volatility := calculateBinanceVolatility(candles5min)
@@ -2122,6 +2138,8 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				ProfitabilityRatio:   profitabilityRatio,
 				DirectionalityFactor: directionalityFactor,
 				OrderBookDepth:       orderBookDepth,
+				TradesPerMinute:      cand.tradesPerMin,
+				ExitLiquidityScore:   exitSpeed,
 			}
 
 			resultChan <- detailedResult{coin: coin}
@@ -2160,12 +2178,12 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	})
 
 	// Debug logging
-	logger.Debugf("FindScalpingCoins: candidates=%d, spreadFiltered=%d, volumeFiltered=%d, atrFiltered=%d, profitabilityFiltered=%d, depthFiltered=%d, otherFiltered=%d, ranked=%d",
-		len(candidatePairs), spreadFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered, len(rankedCoins))
+	logger.Debugf("FindScalpingCoins: candidates=%d, spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, atrFiltered=%d, profitabilityFiltered=%d, depthFiltered=%d, otherFiltered=%d, ranked=%d",
+		len(candidatePairs), spreadFiltered, tradeFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered, len(rankedCoins))
 
 	if len(rankedCoins) == 0 {
-		return nil, fmt.Errorf("no coins passed all filters (spread: %d, volume: %d, ATR: %d, profitability: %d, depth: %d, other: %d)",
-			spreadFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered)
+		return nil, fmt.Errorf("no coins passed all filters (spread: %d, trades: %d, volume: %d, ATR: %d, profitability: %d, depth: %d, other: %d)",
+			spreadFiltered, tradeFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered)
 	}
 
 	// Return top N
@@ -2204,6 +2222,7 @@ type binanceTicker24hr struct {
 	BidPrice           string `json:"bidPrice"`
 	AskPrice           string `json:"askPrice"`
 	PriceChangePercent string `json:"priceChangePercent"`
+	Count              int64  `json:"count"` // Number of trades in the last 24h
 	CloseTime          int64  `json:"closeTime"`
 }
 
@@ -2239,6 +2258,14 @@ func (t *binanceTicker24hr) parseAskPrice() float64 {
 func (t *binanceTicker24hr) parsePriceChangePercent() float64 {
 	percent, _ := strconv.ParseFloat(t.PriceChangePercent, 64)
 	return percent
+}
+
+// tradesPerMinute returns the average trades per minute over the last 24h.
+func (t *binanceTicker24hr) tradesPerMinute() float64 {
+	if t.Count <= 0 {
+		return 0
+	}
+	return float64(t.Count) / 1440.0
 }
 
 // calculateBinanceVolatility calculates the daily volatility as the standard deviation of log returns.
@@ -2689,14 +2716,53 @@ func calculateOrderBookDepthWithinSpread(orderBook *models.OrderBook, midPrice f
 	return askDepth
 }
 
+// calculateExitSpeedFactor favors markets that can be exited quickly after entry.
+// Combines near-spread depth with trade frequency so we prefer books that are both
+// deep at the top and actively trading.
+func calculateExitSpeedFactor(orderBookDepth, tradesPerMinute, depthBaseline float64) float64 {
+	if depthBaseline <= 0 {
+		depthBaseline = 1000
+	}
+
+	// Depth factor: sqrt to soften extremes, normalized to the configured minimum depth
+	depthFactor := math.Sqrt(orderBookDepth / depthBaseline)
+	if depthFactor < 0.6 {
+		depthFactor = 0.6
+	}
+	if depthFactor > 4.0 {
+		depthFactor = 4.0
+	}
+
+	// Trade frequency factor: log scaling to reward steady flow without letting
+	// a few hyperactive pairs dominate. 120 trades/min ~ 2 trades/sec as an upper anchor.
+	tradeFactor := math.Log1p(tradesPerMinute) / math.Log1p(120)
+	if tradeFactor < 0.4 {
+		tradeFactor = 0.4
+	}
+	if tradeFactor > 1.6 {
+		tradeFactor = 1.6
+	}
+
+	exitSpeed := depthFactor * tradeFactor
+	if exitSpeed < 0.25 {
+		exitSpeed = 0.25
+	}
+	if exitSpeed > 6.0 {
+		exitSpeed = 6.0
+	}
+
+	return exitSpeed
+}
+
 // calculateAdvancedScalpingScore computes the advanced scoring algorithm for scalping suitability.
-// Formula: Score = (ATR_5min^volatilityWeight / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor
+// Formula: Score = (ATR_5min^volatilityWeight / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor × ExitSpeedFactor
 // This scoring method prioritizes:
 //   - ATR/Spread ratio: How much price moves relative to cost of trading
 //   - Volatility weight: Raises ATR to a power to favor higher-volatility coins
 //   - Volume factor: Ensures sufficient liquidity (sqrt to reduce impact of very high volume)
 //   - Directionality: Rewards trending movement over choppy action
-func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFactor, volatilityWeight float64) float64 {
+//   - ExitSpeedFactor: Rewards books with active flow + depth for faster exits
+func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFactor, volatilityWeight, exitSpeedFactor float64) float64 {
 	if spread <= 0 {
 		spread = 0.001 // Avoid division by zero
 	}
@@ -2729,7 +2795,11 @@ func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFa
 		directionalityFactor = 1.0
 	}
 
-	score := atrSpreadRatio * volumeFactor * directionalityFactor
+	if exitSpeedFactor <= 0 {
+		exitSpeedFactor = 1.0
+	}
+
+	score := atrSpreadRatio * volumeFactor * directionalityFactor * exitSpeedFactor
 	return score
 }
 

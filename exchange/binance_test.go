@@ -136,6 +136,7 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 	config.MinProfitabilityRatio = 1.5 // Lower threshold for testing
 	config.MinATR5Min = 0.10           // Lower ATR for testing
 	config.MinOrderBookDepth = 1000    // $1k depth for testing
+	config.MinTradesPerMin = 2         // Require at least 2 trades/min for test stability
 	config.TopN = 5
 
 	coins, err := client.FindScalpingCoinsWithConfig(config)
@@ -151,8 +152,8 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 	// Log summary with enhanced metrics
 	t.Logf("Found %d scalping coins", len(coins))
 	for i, coin := range coins {
-		t.Logf("  %d. %s (%s) - Score: %.4f, ATR5Min: %.4f%%, Spread: %.4f%%, Profitability: %.2f, Directionality: %.4f, Depth: $%.2f",
-			i+1, coin.Code, coin.Symbol, coin.Score, coin.ATR5Min, coin.Spread, coin.ProfitabilityRatio, coin.DirectionalityFactor, coin.OrderBookDepth)
+		t.Logf("  %d. %s (%s) - Score: %.4f, ATR5Min: %.4f%%, Spread: %.4f%%, Profitability: %.2f, Directionality: %.4f, Depth: $%.2f, TPM: %.2f, ExitScore: %.2f",
+			i+1, coin.Code, coin.Symbol, coin.Score, coin.ATR5Min, coin.Spread, coin.ProfitabilityRatio, coin.DirectionalityFactor, coin.OrderBookDepth, coin.TradesPerMinute, coin.ExitLiquidityScore)
 	}
 
 	// Validate results
@@ -179,6 +180,12 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 	if coins[0].OrderBookDepth < 1000 {
 		t.Errorf("expected order book depth >= $1000, got $%.2f", coins[0].OrderBookDepth)
 	}
+	if coins[0].TradesPerMinute < config.MinTradesPerMin {
+		t.Errorf("expected trades per minute >= %.2f, got %.2f", config.MinTradesPerMin, coins[0].TradesPerMinute)
+	}
+	if coins[0].ExitLiquidityScore <= 0 {
+		t.Error("expected positive exit liquidity score for first coin")
+	}
 }
 
 // TestBinanceFindScalpingCoinsWithConfig tests the new config-based API
@@ -196,6 +203,7 @@ func TestBinanceFindScalpingCoinsWithConfig(t *testing.T) {
 	config.MinProfitabilityRatio = 1.0 // Minimal profitability threshold
 	config.MinATR5Min = 0.05           // Very low ATR threshold
 	config.MinOrderBookDepth = 500     // Minimal depth requirement
+	config.MinTradesPerMin = 1         // Minimal trade frequency requirement
 	config.TopN = 10
 
 	coins, err := client.FindScalpingCoinsWithConfig(config)
