@@ -541,6 +541,8 @@ type ScalpingCoin struct {
 	OrderBookDepth       float64 // Fillable USD within 0.05% of mid-price (per side)
 	TradesPerMinute      float64 // 24h trades per minute (higher = faster execution/liquidity)
 	ExitLiquidityScore   float64 // Multiplier favoring pairs with deep/active books for quick exits
+	DailyChangePercent   float64 // 24h price change percent (Binance)
+	RecentTrendPct       float64 // Net price change over recent intraday window (Binance 5m candles)
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.

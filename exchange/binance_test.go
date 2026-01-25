@@ -137,6 +137,8 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 	config.MinATR5Min = 0.10           // Lower ATR for testing
 	config.MinOrderBookDepth = 1000    // $1k depth for testing
 	config.MinTradesPerMin = 2         // Require at least 2 trades/min for test stability
+	config.Min24hPriceChange = -50     // Disable downtrend filter in tests to avoid market sensitivity
+	config.MinRecentTrendPct = -50     // Disable intraday trend filter in tests to avoid market sensitivity
 	config.TopN = 5
 
 	coins, err := client.FindScalpingCoinsWithConfig(config)
@@ -204,6 +206,8 @@ func TestBinanceFindScalpingCoinsWithConfig(t *testing.T) {
 	config.MinATR5Min = 0.05           // Very low ATR threshold
 	config.MinOrderBookDepth = 500     // Minimal depth requirement
 	config.MinTradesPerMin = 1         // Minimal trade frequency requirement
+	config.Min24hPriceChange = -50     // Disable downtrend filter in tests to avoid market sensitivity
+	config.MinRecentTrendPct = -50     // Disable intraday trend filter in tests to avoid market sensitivity
 	config.TopN = 10
 
 	coins, err := client.FindScalpingCoinsWithConfig(config)

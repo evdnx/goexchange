@@ -1831,12 +1831,16 @@ type ScalpingConfig struct {
 	MinVolume float64
 	// Minimum trades per minute over the last 24h to ensure active markets (default: 10)
 	MinTradesPerMin float64
+	// Minimum 24h price change percent to avoid coins in steep downtrends (default: -3.0%)
+	Min24hPriceChange float64
 	// Maximum spread percentage (default: 0.08%)
 	MaxSpread float64
 	// Minimum profitability ratio (default: 3.0)
 	MinProfitabilityRatio float64
 	// Minimum ATR percentage on 5-min candles (default: 0.3%)
 	MinATR5Min float64
+	// Minimum recent trend (6h of 5m candles) to avoid coins with fresh downward momentum (default: -0.75%)
+	MinRecentTrendPct float64
 	// Minimum order book depth within 0.05% (default: $5,000)
 	MinOrderBookDepth float64
 	// Taker fee percentage (default: 0.1% for Binance)
@@ -1858,9 +1862,11 @@ func DefaultScalpingConfig() ScalpingConfig {
 		QuoteAsset:            "USDT",
 		MinVolume:             20_000_000, // $20M USD minimum
 		MinTradesPerMin:       10,         // At least 10 trades/min for fast exits
+		Min24hPriceChange:     -3.0,       // Filter out coins down more than 3% in 24h
 		MaxSpread:             0.08,       // 0.08% maximum spread
 		MinProfitabilityRatio: 3.0,        // Profitability ratio > 3.0
 		MinATR5Min:            0.3,        // ATR > 0.3% on 5-min candles
+		MinRecentTrendPct:     -0.75,      // Avoid coins with steep intraday downtrends
 		MinOrderBookDepth:     5000,       // $5k fillable within 0.05%
 		TakerFeePercent:       0.1,        // 0.1% Binance taker fee
 		TopN:                  5,          // Top 5 coins for diversification
@@ -1874,11 +1880,13 @@ func DefaultScalpingConfig() ScalpingConfig {
 //
 // Algorithm Priority:
 //  1. Spread filter: < 0.08% (primary filter - spread is more important than volume)
-//  2. Volume filter: > $20M USD (secondary filter for basic liquidity)
-//  3. Trade frequency filter: > 10 trades/min (ensures continuous flow to exit quickly)
-//  4. Profitability ratio: Volatility / (Spread + 2×Fee) > 3.0
+//  2. Trade frequency filter: > 10 trades/min (ensures continuous flow to exit quickly)
+//  3. Volume filter: > $20M USD (secondary filter for basic liquidity)
+//  4. Downtrend filter: 24h price change above -3% (avoid steep daily losers)
 //  5. ATR filter: > 0.3% on 5-minute candles (tradeable volatility)
-//  6. Order book depth: $5k fillable within 0.05% of mid-price
+//  6. Intraday trend filter: 6h net change above -0.75% (avoid coins still sliding intraday)
+//  7. Profitability ratio: Volatility / (Spread + 2×Fee) > 3.0
+//  8. Order book depth: $5k fillable within 0.05% of mid-price
 //
 // Scoring Formula:
 //
@@ -1961,6 +1969,7 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 		pair         common.TradingPair
 		volume       float64
 		tradesPerMin float64
+		priceChange  float64
 		spread       float64
 		lastPrice    float64
 		bidPrice     float64
@@ -1968,7 +1977,7 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	}
 
 	candidates := make([]candidateData, 0)
-	var spreadFiltered, volumeFiltered, tradeFiltered int
+	var spreadFiltered, volumeFiltered, tradeFiltered, priceChangeFiltered int
 
 	for _, ticker := range allTickers {
 		pair, exists := symbolMap[ticker.Symbol]
@@ -1982,6 +1991,7 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 		lastPrice := ticker.parseLastPrice()
 		bidPrice := ticker.parseBidPrice()
 		askPrice := ticker.parseAskPrice()
+		priceChange := ticker.parsePriceChangePercent()
 
 		// Validate basic price data
 		if lastPrice <= 0 || bidPrice <= 0 || askPrice <= 0 {
@@ -2014,10 +2024,17 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 			continue
 		}
 
+		// DOWN-TREND FILTER: skip steeply negative 24h movers
+		if priceChange < config.Min24hPriceChange {
+			priceChangeFiltered++
+			continue
+		}
+
 		candidates = append(candidates, candidateData{
 			pair:         pair,
 			volume:       volume,
 			tradesPerMin: tradesPerMin,
+			priceChange:  priceChange,
 			spread:       spread,
 			lastPrice:    lastPrice,
 			bidPrice:     bidPrice,
@@ -2025,12 +2042,12 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 		})
 	}
 
-	logger.Debugf("Phase 1: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, remaining=%d",
-		spreadFiltered, tradeFiltered, volumeFiltered, len(candidates))
+	logger.Debugf("Phase 1: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d, remaining=%d",
+		spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, len(candidates))
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no candidates passed initial filters: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d",
-			spreadFiltered, tradeFiltered, volumeFiltered)
+		return nil, fmt.Errorf("no candidates passed initial filters: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d",
+			spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered)
 	}
 
 	// Sort by spread (tightest spreads first) for priority in detailed analysis
@@ -2091,6 +2108,12 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				return
 			}
 
+			recentTrendPct := calculateRecentTrendPercent(candles5min)
+			if recentTrendPct < config.MinRecentTrendPct {
+				resultChan <- detailedResult{err: fmt.Errorf("recent trend too negative: %.2f%% < %.2f%%", recentTrendPct, config.MinRecentTrendPct)}
+				return
+			}
+
 			// Calculate directionality factor
 			directionalityFactor := calculateDirectionalityFactor(candles5min)
 
@@ -2140,6 +2163,8 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				OrderBookDepth:       orderBookDepth,
 				TradesPerMinute:      cand.tradesPerMin,
 				ExitLiquidityScore:   exitSpeed,
+				DailyChangePercent:   cand.priceChange,
+				RecentTrendPct:       recentTrendPct,
 			}
 
 			resultChan <- detailedResult{coin: coin}
@@ -2153,13 +2178,15 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 
 	// Collect results
 	rankedCoins := make([]ScalpingCoin, 0)
-	var atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered int
+	var atrFiltered, profitabilityFiltered, depthFiltered, trendFiltered, otherFiltered int
 
 	for result := range resultChan {
 		if result.err != nil {
 			errStr := result.err.Error()
 			if strings.Contains(errStr, "ATR too low") {
 				atrFiltered++
+			} else if strings.Contains(errStr, "recent trend") {
+				trendFiltered++
 			} else if strings.Contains(errStr, "profitability ratio") {
 				profitabilityFiltered++
 			} else if strings.Contains(errStr, "order book depth") {
@@ -2178,12 +2205,12 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	})
 
 	// Debug logging
-	logger.Debugf("FindScalpingCoins: candidates=%d, spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, atrFiltered=%d, profitabilityFiltered=%d, depthFiltered=%d, otherFiltered=%d, ranked=%d",
-		len(candidatePairs), spreadFiltered, tradeFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered, len(rankedCoins))
+	logger.Debugf("FindScalpingCoins: candidates=%d, spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d, atrFiltered=%d, trendFiltered=%d, profitabilityFiltered=%d, depthFiltered=%d, otherFiltered=%d, ranked=%d",
+		len(candidatePairs), spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, atrFiltered, trendFiltered, profitabilityFiltered, depthFiltered, otherFiltered, len(rankedCoins))
 
 	if len(rankedCoins) == 0 {
-		return nil, fmt.Errorf("no coins passed all filters (spread: %d, trades: %d, volume: %d, ATR: %d, profitability: %d, depth: %d, other: %d)",
-			spreadFiltered, tradeFiltered, volumeFiltered, atrFiltered, profitabilityFiltered, depthFiltered, otherFiltered)
+		return nil, fmt.Errorf("no coins passed all filters (spread: %d, trades: %d, volume: %d, priceChange: %d, ATR: %d, trend: %d, profitability: %d, depth: %d, other: %d)",
+			spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, atrFiltered, trendFiltered, profitabilityFiltered, depthFiltered, otherFiltered)
 	}
 
 	// Return top N
@@ -2663,6 +2690,23 @@ func calculateDirectionalityFactor(candles []models.Candle) float64 {
 	// Scale to a reasonable range (typically 0.001 to 0.1)
 	// Multiply by 100 to get a more usable range
 	return directionality * 100
+}
+
+// calculateRecentTrendPercent returns the net percentage change over the provided candles.
+// Used to avoid coins that are persistently trending down intraday.
+func calculateRecentTrendPercent(candles []models.Candle) float64 {
+	if len(candles) < 2 {
+		return 0
+	}
+
+	first := candles[0].Close
+	last := candles[len(candles)-1].Close
+
+	if first <= 0 || last <= 0 {
+		return 0
+	}
+
+	return ((last - first) / first) * 100
 }
 
 // calculateProfitabilityRatio calculates the profitability ratio for scalping.
