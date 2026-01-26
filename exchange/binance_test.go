@@ -139,6 +139,9 @@ func TestBinanceFindScalpingCoins(t *testing.T) {
 	config.MinTradesPerMin = 2         // Require at least 2 trades/min for test stability
 	config.Min24hPriceChange = -50     // Disable downtrend filter in tests to avoid market sensitivity
 	config.MinRecentTrendPct = -50     // Disable intraday trend filter in tests to avoid market sensitivity
+	config.MinShortTermTrendPct = -50  // Disable short-term trend filter for testing
+	config.MinRelativeStrengthPct = -50
+	config.TrendBiasWeight = 1.0
 	config.TopN = 5
 
 	coins, err := client.FindScalpingCoinsWithConfig(config)
@@ -208,6 +211,9 @@ func TestBinanceFindScalpingCoinsWithConfig(t *testing.T) {
 	config.MinTradesPerMin = 1         // Minimal trade frequency requirement
 	config.Min24hPriceChange = -50     // Disable downtrend filter in tests to avoid market sensitivity
 	config.MinRecentTrendPct = -50     // Disable intraday trend filter in tests to avoid market sensitivity
+	config.MinShortTermTrendPct = -50  // Disable short-term trend filter for testing
+	config.MinRelativeStrengthPct = -50
+	config.TrendBiasWeight = 1.0
 	config.TopN = 10
 
 	coins, err := client.FindScalpingCoinsWithConfig(config)

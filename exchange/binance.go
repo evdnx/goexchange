@@ -1841,6 +1841,12 @@ type ScalpingConfig struct {
 	MinATR5Min float64
 	// Minimum recent trend (6h of 5m candles) to avoid coins with fresh downward momentum (default: -0.75%)
 	MinRecentTrendPct float64
+	// Minimum short-term trend over TrendLookbackMinutes (default: +0.10%)
+	MinShortTermTrendPct float64
+	// Minimum relative strength vs. benchmarks (BTC/ETH) over the same window (default: -0.25%)
+	MinRelativeStrengthPct float64
+	// Lookback window in minutes for short-term trend and relative strength (default: 60 minutes)
+	TrendLookbackMinutes int
 	// Minimum order book depth within 0.05% (default: $5,000)
 	MinOrderBookDepth float64
 	// Taker fee percentage (default: 0.1% for Binance)
@@ -1853,25 +1859,31 @@ type ScalpingConfig struct {
 	// Higher values favor more volatile coins. (default: 1.5 for high-volatility targeting)
 	// Use 1.0 for balanced scoring, 2.0+ for aggressive volatility preference.
 	VolatilityWeight float64
+	// TrendBiasWeight controls how strongly short-term trend/relative strength boosts the score (default: 1.15)
+	TrendBiasWeight float64
 }
 
 // DefaultScalpingConfig returns the recommended configuration for scalping coin selection.
 // By default, volatility weight is set to 1.5 to favor higher-volatility coins.
 func DefaultScalpingConfig() ScalpingConfig {
 	return ScalpingConfig{
-		QuoteAsset:            "USDT",
-		MinVolume:             20_000_000, // $20M USD minimum
-		MinTradesPerMin:       10,         // At least 10 trades/min for fast exits
-		Min24hPriceChange:     -3.0,       // Filter out coins down more than 3% in 24h
-		MaxSpread:             0.08,       // 0.08% maximum spread
-		MinProfitabilityRatio: 3.0,        // Profitability ratio > 3.0
-		MinATR5Min:            0.3,        // ATR > 0.3% on 5-min candles
-		MinRecentTrendPct:     -0.75,      // Avoid coins with steep intraday downtrends
-		MinOrderBookDepth:     5000,       // $5k fillable within 0.05%
-		TakerFeePercent:       0.1,        // 0.1% Binance taker fee
-		TopN:                  5,          // Top 5 coins for diversification
-		RateLimitDelay:        100 * time.Millisecond,
-		VolatilityWeight:      1.5, // Favor high-volatility coins (1.0 = balanced, 2.0+ = aggressive)
+		QuoteAsset:             "USDT",
+		MinVolume:              20_000_000, // $20M USD minimum
+		MinTradesPerMin:        10,         // At least 10 trades/min for fast exits
+		Min24hPriceChange:      -3.0,       // Filter out coins down more than 3% in 24h
+		MaxSpread:              0.08,       // 0.08% maximum spread
+		MinProfitabilityRatio:  3.0,        // Profitability ratio > 3.0
+		MinATR5Min:             0.3,        // ATR > 0.3% on 5-min candles
+		MinRecentTrendPct:      -0.75,      // Avoid coins with steep intraday downtrends
+		MinShortTermTrendPct:   0.10,       // Require mild positive 1h trend bias
+		MinRelativeStrengthPct: -0.25,      // Allow slight underperformance vs BTC/ETH but avoid weak laggards
+		TrendLookbackMinutes:   60,         // 1h short-term trend window
+		MinOrderBookDepth:      5000,       // $5k fillable within 0.05%
+		TakerFeePercent:        0.1,        // 0.1% Binance taker fee
+		TopN:                   5,          // Top 5 coins for diversification
+		RateLimitDelay:         100 * time.Millisecond,
+		VolatilityWeight:       1.5,  // Favor high-volatility coins (1.0 = balanced, 2.0+ = aggressive)
+		TrendBiasWeight:        1.15, // Reward short-term upside/relative strength in scoring
 	}
 }
 
@@ -1885,12 +1897,14 @@ func DefaultScalpingConfig() ScalpingConfig {
 //  4. Downtrend filter: 24h price change above -3% (avoid steep daily losers)
 //  5. ATR filter: > 0.3% on 5-minute candles (tradeable volatility)
 //  6. Intraday trend filter: 6h net change above -0.75% (avoid coins still sliding intraday)
-//  7. Profitability ratio: Volatility / (Spread + 2×Fee) > 3.0
-//  8. Order book depth: $5k fillable within 0.05% of mid-price
+//  7. Short-term trend filter: 60m net change above +0.10% (favor current upside)
+//  8. Relative strength filter: outperform BTC/ETH over 60m by at least -0.25% (avoid laggards)
+//  9. Profitability ratio: Volatility / (Spread + 2×Fee) > 3.0
+//  10. Order book depth: $5k fillable within 0.05% of mid-price
 //
 // Scoring Formula:
 //
-//	Score = (ATR_5min / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor
+//	Score = (ATR_5min / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor × ExitSpeed × TrendBias
 //
 // Where DirectionalityFactor = Σ|returns| / (sign_changes + 1) rewards trending movement.
 //
@@ -1934,6 +1948,11 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	defer cancel()
 
 	logger := common.DefaultLogger()
+
+	trendLookback := config.TrendLookbackMinutes
+	if trendLookback <= 0 {
+		trendLookback = 60
+	}
 
 	// Get all trading pairs, filtering out Seed tokens (high-risk tokens)
 	tradingPairs, err := c.GetTradingPairsWithFilter(true)
@@ -2061,6 +2080,11 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 		candidates = candidates[:maxDetailedCandidates]
 	}
 
+	// Prepare trend baselines for short-term momentum and relative strength (BTC/ETH against the quote asset)
+	since5min := time.Now().Add(-6 * time.Hour) // 6 hours of 5-min candles
+	benchmarkTrends := c.loadBenchmarkTrends(ctx, config.QuoteAsset, since5min, trendLookback)
+	bestBenchmarkTrend, hasBenchmarkTrend := maxBenchmarkTrend(benchmarkTrends)
+
 	// PHASE 2: Detailed analysis with candles and order books
 	type detailedResult struct {
 		coin ScalpingCoin
@@ -2071,7 +2095,6 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	semaphore := make(chan struct{}, 10)
 
 	var wg sync.WaitGroup
-	since5min := time.Now().Add(-6 * time.Hour) // 6 hours of 5-min candles
 
 	for i, cand := range candidates {
 		wg.Add(1)
@@ -2114,6 +2137,21 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				return
 			}
 
+			shortTermTrendPct := calculateTrendPercentWindow(candles5min, trendLookback)
+			if shortTermTrendPct < config.MinShortTermTrendPct {
+				resultChan <- detailedResult{err: fmt.Errorf("short-term trend too weak: %.2f%% < %.2f%%", shortTermTrendPct, config.MinShortTermTrendPct)}
+				return
+			}
+
+			relativeStrengthPct := 0.0
+			if hasBenchmarkTrend {
+				relativeStrengthPct = shortTermTrendPct - bestBenchmarkTrend
+				if relativeStrengthPct < config.MinRelativeStrengthPct {
+					resultChan <- detailedResult{err: fmt.Errorf("relative strength too weak: %.2f%% < %.2f%%", relativeStrengthPct, config.MinRelativeStrengthPct)}
+					return
+				}
+			}
+
 			// Calculate directionality factor
 			directionalityFactor := calculateDirectionalityFactor(candles5min)
 
@@ -2143,8 +2181,10 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 
 			exitSpeed := calculateExitSpeedFactor(orderBookDepth, cand.tradesPerMin, config.MinOrderBookDepth)
 
-			// Calculate advanced score using the new formula with volatility weighting
-			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor, config.VolatilityWeight, exitSpeed)
+			trendBias := calculateTrendBias(shortTermTrendPct, relativeStrengthPct, config.TrendBiasWeight)
+
+			// Calculate advanced score using the new formula with volatility weighting and trend bias
+			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor, config.VolatilityWeight, exitSpeed, trendBias)
 
 			// Also calculate legacy volatility for backward compatibility
 			volatility := calculateBinanceVolatility(candles5min)
@@ -2165,6 +2205,9 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				ExitLiquidityScore:   exitSpeed,
 				DailyChangePercent:   cand.priceChange,
 				RecentTrendPct:       recentTrendPct,
+				ShortTermTrendPct:    shortTermTrendPct,
+				RelativeStrengthPct:  relativeStrengthPct,
+				TrendBias:            trendBias,
 			}
 
 			resultChan <- detailedResult{coin: coin}
@@ -2178,7 +2221,7 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 
 	// Collect results
 	rankedCoins := make([]ScalpingCoin, 0)
-	var atrFiltered, profitabilityFiltered, depthFiltered, trendFiltered, otherFiltered int
+	var atrFiltered, profitabilityFiltered, depthFiltered, trendFiltered, shortTrendFiltered, relativeStrengthFiltered, otherFiltered int
 
 	for result := range resultChan {
 		if result.err != nil {
@@ -2187,6 +2230,10 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				atrFiltered++
 			} else if strings.Contains(errStr, "recent trend") {
 				trendFiltered++
+			} else if strings.Contains(errStr, "short-term trend") {
+				shortTrendFiltered++
+			} else if strings.Contains(errStr, "relative strength") {
+				relativeStrengthFiltered++
 			} else if strings.Contains(errStr, "profitability ratio") {
 				profitabilityFiltered++
 			} else if strings.Contains(errStr, "order book depth") {
@@ -2205,12 +2252,12 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	})
 
 	// Debug logging
-	logger.Debugf("FindScalpingCoins: candidates=%d, spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d, atrFiltered=%d, trendFiltered=%d, profitabilityFiltered=%d, depthFiltered=%d, otherFiltered=%d, ranked=%d",
-		len(candidatePairs), spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, atrFiltered, trendFiltered, profitabilityFiltered, depthFiltered, otherFiltered, len(rankedCoins))
+	logger.Debugf("FindScalpingCoins: candidates=%d, spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d, atrFiltered=%d, trendFiltered=%d, shortTrendFiltered=%d, relativeStrengthFiltered=%d, profitabilityFiltered=%d, depthFiltered=%d, otherFiltered=%d, ranked=%d",
+		len(candidatePairs), spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, atrFiltered, trendFiltered, shortTrendFiltered, relativeStrengthFiltered, profitabilityFiltered, depthFiltered, otherFiltered, len(rankedCoins))
 
 	if len(rankedCoins) == 0 {
-		return nil, fmt.Errorf("no coins passed all filters (spread: %d, trades: %d, volume: %d, priceChange: %d, ATR: %d, trend: %d, profitability: %d, depth: %d, other: %d)",
-			spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, atrFiltered, trendFiltered, profitabilityFiltered, depthFiltered, otherFiltered)
+		return nil, fmt.Errorf("no coins passed all filters (spread: %d, trades: %d, volume: %d, priceChange: %d, ATR: %d, trend: %d, shortTrend: %d, relativeStrength: %d, profitability: %d, depth: %d, other: %d)",
+			spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, atrFiltered, trendFiltered, shortTrendFiltered, relativeStrengthFiltered, profitabilityFiltered, depthFiltered, otherFiltered)
 	}
 
 	// Return top N
@@ -2219,6 +2266,51 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	}
 
 	return rankedCoins, nil
+}
+
+// loadBenchmarkTrends fetches short-term trend data for benchmark assets (BTC/ETH) against the provided quote.
+// Used to compute relative strength for scalping candidates without per-symbol overhead.
+func (c *BinanceClient) loadBenchmarkTrends(ctx context.Context, quoteAsset string, since time.Time, lookbackMinutes int) map[string]float64 {
+	benchmarks := []string{"BTC", "ETH"}
+	trends := make(map[string]float64, len(benchmarks))
+
+	if lookbackMinutes <= 0 {
+		lookbackMinutes = 60
+	}
+
+	quoteAsset = strings.ToUpper(quoteAsset)
+
+	for _, base := range benchmarks {
+		select {
+		case <-ctx.Done():
+			return trends
+		default:
+		}
+
+		symbol := fmt.Sprintf("%s/%s", base, quoteAsset)
+		candles, err := c.GetCandles(symbol, "5m", since, 72)
+		if err != nil || len(candles) < 5 {
+			continue
+		}
+
+		trends[base] = calculateTrendPercentWindow(candles, lookbackMinutes)
+	}
+
+	return trends
+}
+
+func maxBenchmarkTrend(trends map[string]float64) (float64, bool) {
+	var maxTrend float64
+	var hasValue bool
+
+	for _, v := range trends {
+		if !hasValue || v > maxTrend {
+			maxTrend = v
+			hasValue = true
+		}
+	}
+
+	return maxTrend, hasValue
 }
 
 // getAllTickers24hr fetches all 24h ticker statistics in one batch API call.
@@ -2709,6 +2801,69 @@ func calculateRecentTrendPercent(candles []models.Candle) float64 {
 	return ((last - first) / first) * 100
 }
 
+// calculateTrendPercentWindow returns the net percentage change over the trailing windowMinutes of candles.
+// Uses 5m candles, so the window is rounded up to the nearest candle count.
+func calculateTrendPercentWindow(candles []models.Candle, windowMinutes int) float64 {
+	if len(candles) < 2 || windowMinutes <= 0 {
+		return 0
+	}
+
+	windowCandles := windowMinutes / 5
+	if windowMinutes%5 != 0 {
+		windowCandles++
+	}
+	if windowCandles < 2 {
+		windowCandles = 2
+	}
+	if windowCandles > len(candles) {
+		windowCandles = len(candles)
+	}
+
+	startIdx := len(candles) - windowCandles
+	first := candles[startIdx].Close
+	last := candles[len(candles)-1].Close
+
+	if first <= 0 || last <= 0 {
+		return 0
+	}
+
+	return ((last - first) / first) * 100
+}
+
+// calculateTrendBias creates a scoring multiplier that rewards positive short-term momentum
+// and relative strength while clamping extremes to keep scores stable.
+func calculateTrendBias(shortTermTrendPct, relativeStrengthPct, weight float64) float64 {
+	trendFactor := 1.0 + (shortTermTrendPct / 5.0) // 1% move ~20% boost
+	if trendFactor < 0.5 {
+		trendFactor = 0.5
+	}
+	if trendFactor > 1.8 {
+		trendFactor = 1.8
+	}
+
+	rsFactor := 1.0 + (relativeStrengthPct / 4.0) // 1% RS outperformance ~25% boost
+	if rsFactor < 0.6 {
+		rsFactor = 0.6
+	}
+	if rsFactor > 1.6 {
+		rsFactor = 1.6
+	}
+
+	if weight <= 0 {
+		weight = 1.0
+	}
+
+	trendBias := math.Pow(trendFactor*rsFactor, weight)
+	if trendBias < 0.5 {
+		trendBias = 0.5
+	}
+	if trendBias > 3.0 {
+		trendBias = 3.0
+	}
+
+	return trendBias
+}
+
 // calculateProfitabilityRatio calculates the profitability ratio for scalping.
 // Formula: Volatility / (Spread + 2 × TakerFee)
 // Minimum threshold should be > 3.0 for profitable scalping.
@@ -2799,14 +2954,15 @@ func calculateExitSpeedFactor(orderBookDepth, tradesPerMinute, depthBaseline flo
 }
 
 // calculateAdvancedScalpingScore computes the advanced scoring algorithm for scalping suitability.
-// Formula: Score = (ATR_5min^volatilityWeight / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor × ExitSpeedFactor
+// Formula: Score = (ATR_5min^volatilityWeight / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor × ExitSpeedFactor × TrendBias
 // This scoring method prioritizes:
 //   - ATR/Spread ratio: How much price moves relative to cost of trading
 //   - Volatility weight: Raises ATR to a power to favor higher-volatility coins
 //   - Volume factor: Ensures sufficient liquidity (sqrt to reduce impact of very high volume)
 //   - Directionality: Rewards trending movement over choppy action
 //   - ExitSpeedFactor: Rewards books with active flow + depth for faster exits
-func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFactor, volatilityWeight, exitSpeedFactor float64) float64 {
+//   - TrendBias: Rewards pairs with short-term upside and relative strength
+func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFactor, volatilityWeight, exitSpeedFactor, trendBias float64) float64 {
 	if spread <= 0 {
 		spread = 0.001 // Avoid division by zero
 	}
@@ -2843,7 +2999,11 @@ func calculateAdvancedScalpingScore(atr5min, spread, volume24h, directionalityFa
 		exitSpeedFactor = 1.0
 	}
 
-	score := atrSpreadRatio * volumeFactor * directionalityFactor * exitSpeedFactor
+	if trendBias <= 0 {
+		trendBias = 1.0
+	}
+
+	score := atrSpreadRatio * volumeFactor * directionalityFactor * exitSpeedFactor * trendBias
 	return score
 }
 

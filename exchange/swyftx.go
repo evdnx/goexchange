@@ -543,6 +543,9 @@ type ScalpingCoin struct {
 	ExitLiquidityScore   float64 // Multiplier favoring pairs with deep/active books for quick exits
 	DailyChangePercent   float64 // 24h price change percent (Binance)
 	RecentTrendPct       float64 // Net price change over recent intraday window (Binance 5m candles)
+	ShortTermTrendPct    float64 // Short-term momentum over TrendLookbackMinutes (Binance 5m candles)
+	RelativeStrengthPct  float64 // Outperformance vs BTC/ETH over the same window (Binance)
+	TrendBias            float64 // Scoring multiplier derived from short-term trend/relative strength
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
