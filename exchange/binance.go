@@ -1861,6 +1861,11 @@ type ScalpingConfig struct {
 	VolatilityWeight float64
 	// TrendBiasWeight controls how strongly short-term trend/relative strength boosts the score (default: 1.15)
 	TrendBiasWeight float64
+	// UptrendWeight boosts scores for coins with multi-timeframe upside (24h + 6h + 1h).
+	// 0.0 disables the boost, 1.0 applies the default emphasis.
+	UptrendWeight float64
+	// StrongUptrendOnly tightens trend filters (24h, 6h, 1h, RS) to require clear upside.
+	StrongUptrendOnly bool
 }
 
 // DefaultScalpingConfig returns the recommended configuration for scalping coin selection.
@@ -1884,6 +1889,8 @@ func DefaultScalpingConfig() ScalpingConfig {
 		RateLimitDelay:         100 * time.Millisecond,
 		VolatilityWeight:       1.5,  // Favor high-volatility coins (1.0 = balanced, 2.0+ = aggressive)
 		TrendBiasWeight:        1.15, // Reward short-term upside/relative strength in scoring
+		UptrendWeight:          1.0,  // Moderate boost for aligned multi-timeframe uptrends
+		StrongUptrendOnly:      false,
 	}
 }
 
@@ -1907,6 +1914,7 @@ func DefaultScalpingConfig() ScalpingConfig {
 //	Score = (ATR_5min / Spread) × sqrt(Volume_24h / 10M) × DirectionalityFactor × ExitSpeed × TrendBias
 //
 // Where DirectionalityFactor = Σ|returns| / (sign_changes + 1) rewards trending movement.
+// TrendBias itself is composed of short-term trend/relative strength and an optional multi-timeframe uptrend boost.
 //
 // Parameters:
 //   - quoteAsset: The quote currency to use (default: "USDT")
@@ -1952,6 +1960,27 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	trendLookback := config.TrendLookbackMinutes
 	if trendLookback <= 0 {
 		trendLookback = 60
+	}
+
+	// Normalize tunables to safe ranges
+	if config.UptrendWeight < 0 {
+		config.UptrendWeight = 0
+	}
+
+	// Optional "uptrend only" mode tightens trend gates without changing caller thresholds.
+	if config.StrongUptrendOnly {
+		if config.Min24hPriceChange < 0.5 {
+			config.Min24hPriceChange = 0.5 // Require green daily tape
+		}
+		if config.MinRecentTrendPct < 0.5 {
+			config.MinRecentTrendPct = 0.5 // Require upside over the last ~6h
+		}
+		if config.MinShortTermTrendPct < 0.35 {
+			config.MinShortTermTrendPct = 0.35 // Bias to actively rising 1h slope
+		}
+		if config.MinRelativeStrengthPct < 0 {
+			config.MinRelativeStrengthPct = 0 // Must at least keep up with BTC/ETH
+		}
 	}
 
 	// Get all trading pairs, filtering out Seed tokens (high-risk tokens)
@@ -2182,9 +2211,11 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 			exitSpeed := calculateExitSpeedFactor(orderBookDepth, cand.tradesPerMin, config.MinOrderBookDepth)
 
 			trendBias := calculateTrendBias(shortTermTrendPct, relativeStrengthPct, config.TrendBiasWeight)
+			uptrendFactor := calculateUptrendFactor(recentTrendPct, shortTermTrendPct, cand.priceChange, config.UptrendWeight)
+			totalTrendBias := trendBias * uptrendFactor
 
 			// Calculate advanced score using the new formula with volatility weighting and trend bias
-			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor, config.VolatilityWeight, exitSpeed, trendBias)
+			score := calculateAdvancedScalpingScore(atr5min, cand.spread, cand.volume, directionalityFactor, config.VolatilityWeight, exitSpeed, totalTrendBias)
 
 			// Also calculate legacy volatility for backward compatibility
 			volatility := calculateBinanceVolatility(candles5min)
@@ -2207,7 +2238,8 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 				RecentTrendPct:       recentTrendPct,
 				ShortTermTrendPct:    shortTermTrendPct,
 				RelativeStrengthPct:  relativeStrengthPct,
-				TrendBias:            trendBias,
+				TrendBias:            totalTrendBias,
+				UptrendFactor:        uptrendFactor,
 			}
 
 			resultChan <- detailedResult{coin: coin}
@@ -2862,6 +2894,30 @@ func calculateTrendBias(shortTermTrendPct, relativeStrengthPct, weight float64) 
 	}
 
 	return trendBias
+}
+
+// calculateUptrendFactor boosts scoring for multi-timeframe upside alignment.
+// It blends 24h change (20%), 6h intraday drift (30%), and short-term 1h momentum (50%).
+// weight controls strength; 0 disables the boost.
+func calculateUptrendFactor(recentTrendPct, shortTermTrendPct, dailyChangePct, weight float64) float64 {
+	if weight <= 0 {
+		return 1.0
+	}
+
+	// Composite favors current momentum while still respecting broader context.
+	composite := (shortTermTrendPct * 0.5) + (recentTrendPct * 0.3) + (dailyChangePct * 0.2)
+
+	// Each ~8% composite move adds roughly 1× weight to the multiplier.
+	factor := 1.0 + (composite/8.0)*weight
+
+	if factor < 0.5 {
+		factor = 0.5
+	}
+	if factor > 3.0 {
+		factor = 3.0
+	}
+
+	return factor
 }
 
 // calculateProfitabilityRatio calculates the profitability ratio for scalping.

@@ -545,7 +545,8 @@ type ScalpingCoin struct {
 	RecentTrendPct       float64 // Net price change over recent intraday window (Binance 5m candles)
 	ShortTermTrendPct    float64 // Short-term momentum over TrendLookbackMinutes (Binance 5m candles)
 	RelativeStrengthPct  float64 // Outperformance vs BTC/ETH over the same window (Binance)
-	TrendBias            float64 // Scoring multiplier derived from short-term trend/relative strength
+	TrendBias            float64 // Scoring multiplier derived from short-term trend/relative strength (plus uptrend boost)
+	UptrendFactor        float64 // Additional multiplier rewarding aligned 24h/6h/1h upside
 }
 
 // FindScalpingCoins analyzes all active trading pairs to find the most suitable coins for scalping.
