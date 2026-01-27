@@ -3516,6 +3516,80 @@ type BinanceUserDataUpdate struct {
 	Data      map[string]interface{} `json:"data"`
 }
 
+// binanceExecutionReport represents the executionReport payload from the user data stream.
+// Reference: https://developers.binance.com/docs/binance-spot-api-docs/websocket-api#event-order-update
+type binanceExecutionReport struct {
+	EventType string `json:"e"`
+	EventTime int64  `json:"E"`
+	Symbol    string `json:"s"`
+
+	ClientOrderID string `json:"c"`
+	OrderSide     string `json:"S"`
+	OrderType     string `json:"o"`
+	TimeInForce   string `json:"f"`
+	Price         string `json:"p"`
+	Quantity      string `json:"q"`
+	StopPrice     string `json:"P"`
+	IcebergQty    string `json:"F"`
+
+	OrderListID  int64  `json:"g"`
+	OrigClientID string `json:"C"`
+	OrderID      int64  `json:"i"`
+
+	ExecutionType            string `json:"x"`
+	OrderStatus              string `json:"X"`
+	RejectReason             string `json:"r"`
+	LastExecutedQuantity     string `json:"l"`
+	CumulativeFilledQuantity string `json:"z"`
+	LastExecutedPrice        string `json:"L"`
+	CommissionAmount         string `json:"n"`
+	CommissionAsset          string `json:"N"`
+
+	TradeTime int64 `json:"T"`
+	TradeID   int64 `json:"t"`
+	IsMaker   bool  `json:"m"`
+}
+
+// toCommonOrder converts the executionReport payload to the unified Order model.
+func (er binanceExecutionReport) toCommonOrder() (common.Order, error) {
+	status, err := binanceStatusToCommon(er.OrderStatus)
+	if err != nil {
+		return common.Order{}, err
+	}
+
+	price, _ := strconv.ParseFloat(er.Price, 64)
+	quantity, _ := strconv.ParseFloat(er.Quantity, 64)
+	filled, _ := strconv.ParseFloat(er.CumulativeFilledQuantity, 64)
+	remaining := quantity - filled
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	orderTime := er.EventTime
+	if orderTime == 0 {
+		orderTime = er.TradeTime
+	}
+
+	return common.Order{
+		ID:              strconv.FormatInt(er.OrderID, 10),
+		ClientOrderID:   er.ClientOrderID,
+		Symbol:          convertFromBinanceSymbol(er.Symbol),
+		Side:            common.OrderSideFromString(strings.ToLower(er.OrderSide)),
+		Type:            common.OrderTypeFromString(strings.ToLower(er.OrderType)),
+		Status:          status,
+		Price:           price,
+		Amount:          quantity,
+		FilledAmount:    filled,
+		RemainingAmount: remaining,
+		Fee:             0,
+		FeeCurrency:     er.CommissionAsset,
+		CreatedAt:       time.Unix(orderTime/1000, 0),
+		UpdatedAt:       time.Unix(orderTime/1000, 0),
+		Quantity:        quantity,
+		Timestamp:       time.Unix(orderTime/1000, 0),
+	}, nil
+}
+
 type BinanceTickerSubscription struct {
 	Symbol string
 }
@@ -3939,6 +4013,21 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 		if err := json.Unmarshal(streamData.Data, &userData); err != nil {
 			return err
 		}
+		// First, try typed order callback for executionReport events
+		if orderCb, ok := callback.(func(common.Order)); ok && strings.EqualFold(userData.EventType, "executionReport") {
+			var er binanceExecutionReport
+			if err := json.Unmarshal(streamData.Data, &er); err != nil {
+				return err
+			}
+			order, err := er.toCommonOrder()
+			if err != nil {
+				return err
+			}
+			orderCb(order)
+			return nil
+		}
+
+		// Fallback to generic user-data callback
 		if cb, ok := callback.(func(models.UserData)); ok {
 			cb(models.UserData{
 				Exchange:  "Binance",
@@ -4066,6 +4155,30 @@ func (c *BinanceWebSocketClient) SubscribeToUserData(callback func(models.UserDa
 	streamName := sub.StreamName()
 	if err := c.batchSubscribe([]string{streamName}); err != nil {
 		return fmt.Errorf("failed to subscribe to user data: %w", err)
+	}
+	c.mu.Lock()
+	c.callbacks[streamName] = callback
+	c.subscriptions[streamName] = sub
+	c.mu.Unlock()
+	return nil
+}
+
+// SubscribeToOrderUpdates subscribes specifically to executionReport user data events
+// and delivers them as unified common.Order objects via the provided callback.
+func (c *BinanceWebSocketClient) SubscribeToOrderUpdates(callback func(common.Order)) error {
+	listenKey, err := c.getListenKey()
+	if err != nil {
+		return err
+	}
+	if !c.IsConnected() {
+		if err := c.Connect(); err != nil {
+			return err
+		}
+	}
+	sub := &BinanceUserDataSubscription{ListenKey: listenKey}
+	streamName := sub.StreamName()
+	if err := c.batchSubscribe([]string{streamName}); err != nil {
+		return fmt.Errorf("failed to subscribe to order updates: %w", err)
 	}
 	c.mu.Lock()
 	c.callbacks[streamName] = callback
