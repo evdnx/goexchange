@@ -123,6 +123,45 @@ type SpotPosition struct {
 	IsTradeable bool    // Whether this asset can be traded
 }
 
+// BinanceDustConvertibleAsset represents a single dust-eligible asset entry.
+type BinanceDustConvertibleAsset struct {
+	Asset                    string `json:"asset"`
+	AssetFullName            string `json:"assetFullName"`
+	AmountFree               string `json:"amountFree"`
+	Exchange                 string `json:"exchange"`
+	ToQuotaAssetAmount       string `json:"toQuotaAssetAmount"`
+	ToTargetAssetAmount      string `json:"toTargetAssetAmount"`
+	ToTargetAssetOffExchange string `json:"toTargetAssetOffExchange"`
+}
+
+// BinanceDustConvertibleAssetsResponse represents the response from the dust-convertible assets endpoint.
+type BinanceDustConvertibleAssetsResponse struct {
+	DribbletPercentage             string                        `json:"dribbletPercentage"`
+	TotalTransferQuotaAssetAmount  string                        `json:"totalTransferQuotaAssetAmount"`
+	TotalTransferTargetAssetAmount string                        `json:"totalTransferTargetAssetAmount"`
+	DribbletBase                   string                        `json:"dribbletBase"`
+	Details                        []BinanceDustConvertibleAsset `json:"details"`
+	BinanceResponse
+}
+
+// BinanceDustTransfer represents a single dust conversion result entry.
+type BinanceDustTransfer struct {
+	TranID              int64  `json:"tranId"`
+	FromAsset           string `json:"fromAsset"`
+	Amount              string `json:"amount"`
+	TransferedAmount    string `json:"transferedAmount"`
+	ServiceChargeAmount string `json:"serviceChargeAmount"`
+	OperateTime         int64  `json:"operateTime"`
+}
+
+// BinanceDustConvertResult represents the response from the dust convert endpoint.
+type BinanceDustConvertResult struct {
+	TotalTransfered    string                `json:"totalTransfered"`
+	TotalServiceCharge string                `json:"totalServiceCharge"`
+	TransferResult     []BinanceDustTransfer `json:"transferResult"`
+	BinanceResponse
+}
+
 const (
 	StreamTicker     BinanceStreamType = "ticker"
 	StreamKline      BinanceStreamType = "kline"
@@ -340,6 +379,11 @@ func (c *BinanceClient) apiPath(version string) string {
 	return constructAPIPath(c.baseURL, version)
 }
 
+// sapiPath constructs the SAPI path correctly based on whether baseURL already includes "/api".
+func (c *BinanceClient) sapiPath(version string) string {
+	return constructServicePath(c.baseURL, "sapi", version)
+}
+
 // constructAPIPath is a helper function that constructs the API path correctly
 // based on whether baseURL already includes "/api"
 func constructAPIPath(baseURL, version string) string {
@@ -347,6 +391,17 @@ func constructAPIPath(baseURL, version string) string {
 		return fmt.Sprintf("%s/%s", baseURL, version)
 	}
 	return fmt.Sprintf("%s/api/%s", baseURL, version)
+}
+
+// constructServicePath builds service paths (api, sapi, etc.) using a base URL that may already include "/api" or "/sapi".
+func constructServicePath(baseURL, service, version string) string {
+	base := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(base, "/api") {
+		base = strings.TrimSuffix(base, "/api")
+	} else if strings.HasSuffix(base, "/sapi") {
+		base = strings.TrimSuffix(base, "/sapi")
+	}
+	return fmt.Sprintf("%s/%s/%s", base, service, version)
 }
 
 // convertToBinanceSymbol converts symbol format (e.g., "BTC/USDT" to "BTCUSDT")
@@ -1253,6 +1308,112 @@ func (c *BinanceClient) isDustPosition(asset string, amount float64) bool {
 	}
 
 	return amount < threshold
+}
+
+// GetDustConvertibleAssets retrieves the list of small balances eligible for dust conversion.
+// This uses Binance's dust-convert endpoint (SAPI). The target asset is typically "USDT" or "BNB".
+func (c *BinanceClient) GetDustConvertibleAssets(targetAsset string) (*BinanceDustConvertibleAssetsResponse, error) {
+	if c.IsTestnet() {
+		return nil, fmt.Errorf("dust conversion is not available on Binance demo/testnet endpoints")
+	}
+	target := strings.ToUpper(strings.TrimSpace(targetAsset))
+	if target == "" {
+		return nil, fmt.Errorf("target asset is required")
+	}
+	endpoint := fmt.Sprintf("%s/asset/dust-convert/query-convertible-assets", c.sapiPath("v1"))
+	params := url.Values{}
+	params.Add("targetAsset", target)
+	params = c.addSignature(params)
+
+	response, err := c.doPost(endpoint, []byte(params.Encode()), map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query dust convertible assets: %w", err)
+	}
+
+	var resp BinanceDustConvertibleAssetsResponse
+	if err := json.Unmarshal(response, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse dust convertible assets response: %w", err)
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("dust convertible assets error: %s", resp.Message)
+	}
+	return &resp, nil
+}
+
+// ConvertDustToAsset converts the provided dust assets into the target asset (e.g., USDT).
+func (c *BinanceClient) ConvertDustToAsset(assets []string, targetAsset string) (*BinanceDustConvertResult, error) {
+	if c.IsTestnet() {
+		return nil, fmt.Errorf("dust conversion is not available on Binance demo/testnet endpoints")
+	}
+	if len(assets) == 0 {
+		return nil, fmt.Errorf("at least one asset is required for dust conversion")
+	}
+	target := strings.ToUpper(strings.TrimSpace(targetAsset))
+	params := url.Values{}
+	if target != "" {
+		params.Add("targetAsset", target)
+	}
+
+	unique := make(map[string]struct{}, len(assets))
+	deduped := make([]string, 0, len(assets))
+	for _, asset := range assets {
+		normalized := strings.ToUpper(strings.TrimSpace(asset))
+		if normalized == "" {
+			continue
+		}
+		if _, exists := unique[normalized]; exists {
+			continue
+		}
+		unique[normalized] = struct{}{}
+		deduped = append(deduped, normalized)
+	}
+	if len(deduped) == 0 {
+		return nil, fmt.Errorf("no valid assets provided for dust conversion")
+	}
+	params.Add("asset", strings.Join(deduped, ","))
+	params = c.addSignature(params)
+
+	endpoint := fmt.Sprintf("%s/asset/dust-convert/convert", c.sapiPath("v1"))
+	response, err := c.doPost(endpoint, []byte(params.Encode()), map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert dust assets: %w", err)
+	}
+
+	var resp BinanceDustConvertResult
+	if err := json.Unmarshal(response, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse dust convert response: %w", err)
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("dust convert error: %s", resp.Message)
+	}
+	return &resp, nil
+}
+
+// ConvertAllDustToUSDT converts all eligible dust balances to USDT in one request.
+func (c *BinanceClient) ConvertAllDustToUSDT() (*BinanceDustConvertResult, error) {
+	eligible, err := c.GetDustConvertibleAssets("USDT")
+	if err != nil {
+		return nil, err
+	}
+	if len(eligible.Details) == 0 {
+		return nil, fmt.Errorf("no dust assets eligible for conversion to USDT")
+	}
+
+	assets := make([]string, 0, len(eligible.Details))
+	for _, detail := range eligible.Details {
+		if detail.Asset == "" {
+			continue
+		}
+		assets = append(assets, detail.Asset)
+	}
+	if len(assets) == 0 {
+		return nil, fmt.Errorf("no dust assets eligible for conversion to USDT")
+	}
+	return c.ConvertDustToAsset(assets, "USDT")
 }
 
 // GetOpenOrders retrieves all open orders for a symbol
