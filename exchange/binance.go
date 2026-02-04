@@ -204,14 +204,15 @@ func NewBinanceClient(apiKey, apiSecret string, testnet bool, metrics *metrics.M
 
 	baseURL := "https://api.binance.com"
 	futuresBaseURL := "https://fapi.binance.com"
-	wsURL := "wss://stream.binance.com:9443"
+	// Use combined stream endpoint for proper message format with {"stream": "...", "data": {...}}
+	wsURL := "wss://stream.binance.com:9443/stream"
 
 	if testnet {
 		// For demo accounts, use demo-api.binance.com
 		// Note: Demo environment may not support all endpoints (e.g., /order/test)
 		baseURL = "https://demo-api.binance.com/api"
 		futuresBaseURL = "https://testnet.binancefuture.com" // Prepend "/fapi" for USDT-M or "/dapi" for Coin-M in endpoints, e.g., futuresBaseURL + "/fapi/v1/ticker/price"
-		wsURL = "wss://demo-api.binance.com"                 // Append "/ws" for user data or "/stream" for market data/combined streams, e.g., wsURL + "/ws" or wsURL + "/stream?streams=..."
+		wsURL = "wss://demo-api.binance.com/stream"          // Combined stream endpoint for user data and market data
 	}
 
 	client := &BinanceClient{
@@ -3974,6 +3975,7 @@ func (c *BinanceWebSocketClient) URL() string {
 
 // HandleMessage processes incoming WebSocket messages
 func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
+	// First, check if this is a subscription response
 	var subResponse struct {
 		Result interface{} `json:"result"`
 		ID     int64       `json:"id"`
@@ -3982,6 +3984,7 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 		return nil
 	}
 
+	// Try to parse as combined stream format: {"stream": "...", "data": {...}}
 	var streamData struct {
 		Stream string          `json:"stream"`
 		Data   json.RawMessage `json:"data"`
@@ -3989,14 +3992,18 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 	if err := json.Unmarshal(message, &streamData); err != nil {
 		return fmt.Errorf("failed to parse message: %w", err)
 	}
+
+	// If no stream wrapper, try to handle as direct user data message (executionReport, etc.)
 	if streamData.Stream == "" {
-		return nil
+		return c.handleDirectMessage(message)
 	}
 
 	c.mu.RLock()
 	callback, ok := c.callbacks[streamData.Stream]
 	c.mu.RUnlock()
 	if !ok {
+		// Log unhandled streams for debugging (could be subscription confirmations or other events)
+		c.logger.Debugf("[%s] no callback registered for stream: %s", binanceWSComponent, streamData.Stream)
 		return nil
 	}
 
@@ -4200,6 +4207,79 @@ func (c *BinanceWebSocketClient) HandleMessage(message []byte) error {
 	return nil
 }
 
+// handleDirectMessage handles messages that arrive without the combined stream wrapper.
+// This can happen with user data streams when connected to /ws/<listenKey> endpoint
+// instead of /stream endpoint, or in certain edge cases.
+func (c *BinanceWebSocketClient) handleDirectMessage(message []byte) error {
+	// Try to parse as execution report (order update)
+	var eventType struct {
+		EventType string `json:"e"`
+	}
+	if err := json.Unmarshal(message, &eventType); err != nil {
+		c.logger.Debugf("[%s] failed to parse direct message event type: %v", binanceWSComponent, err)
+		return nil
+	}
+
+	if eventType.EventType == "" {
+		return nil
+	}
+
+	c.logger.Debugf("[%s] received direct message with event type: %s", binanceWSComponent, eventType.EventType)
+
+	// Find any registered order update callback (registered with listen key)
+	c.mu.RLock()
+	var orderCallback func(common.Order)
+	var userDataCallback func(models.UserData)
+	for _, cb := range c.callbacks {
+		if orderCb, ok := cb.(func(common.Order)); ok {
+			orderCallback = orderCb
+		}
+		if userCb, ok := cb.(func(models.UserData)); ok {
+			userDataCallback = userCb
+		}
+	}
+	c.mu.RUnlock()
+
+	switch strings.ToLower(eventType.EventType) {
+	case "executionreport":
+		if orderCallback != nil {
+			var er binanceExecutionReport
+			if err := json.Unmarshal(message, &er); err != nil {
+				return fmt.Errorf("failed to parse direct executionReport: %w", err)
+			}
+			order, err := er.toCommonOrder()
+			if err != nil {
+				return fmt.Errorf("failed to convert executionReport to order: %w", err)
+			}
+			c.logger.Debugf("[%s] processing direct executionReport for order %s, status: %s",
+				binanceWSComponent, order.ID, order.Status)
+			orderCallback(order)
+			return nil
+		}
+		c.logger.Warnf("[%s] received executionReport but no order callback registered", binanceWSComponent)
+
+	case "outboundaccountposition", "balanceupdate", "listenstatus":
+		// Handle other user data events via the generic callback
+		if userDataCallback != nil {
+			var userData BinanceUserDataUpdate
+			if err := json.Unmarshal(message, &userData); err != nil {
+				return fmt.Errorf("failed to parse direct user data: %w", err)
+			}
+			userDataCallback(models.UserData{
+				Exchange:  "Binance",
+				EventType: userData.EventType,
+				Data:      userData.Data,
+			})
+			return nil
+		}
+
+	default:
+		c.logger.Debugf("[%s] unhandled direct message event type: %s", binanceWSComponent, eventType.EventType)
+	}
+
+	return nil
+}
+
 // SubscribeToTicker subscribes to ticker updates (OHLCV + Bid/Ask)
 // This subscribes to both @miniTicker (for OHLCV) and @bookTicker (for bid/ask) streams
 // and merges the data before calling the callback.
@@ -4321,6 +4401,7 @@ func (c *BinanceWebSocketClient) SubscribeToUserData(callback func(models.UserDa
 	c.callbacks[streamName] = callback
 	c.subscriptions[streamName] = sub
 	c.mu.Unlock()
+	c.logger.Debugf("[%s] subscribed to user data stream: %s", binanceWSComponent, streamName)
 	return nil
 }
 
@@ -4345,7 +4426,112 @@ func (c *BinanceWebSocketClient) SubscribeToOrderUpdates(callback func(common.Or
 	c.callbacks[streamName] = callback
 	c.subscriptions[streamName] = sub
 	c.mu.Unlock()
+	c.logger.Debugf("[%s] subscribed to order updates stream: %s", binanceWSComponent, streamName)
 	return nil
+}
+
+// WaitForOrderConfirmation waits for an order status update via WebSocket.
+// It subscribes to order updates if not already subscribed, then waits for the specific order ID.
+// Returns the confirmed order status or an error if the timeout is reached.
+// Parameters:
+//   - orderID: the order ID to wait for (as string)
+//   - timeout: maximum time to wait for confirmation
+//   - acceptedStatuses: list of statuses that count as "confirmed" (e.g., NEW, FILLED, PARTIALLY_FILLED)
+//     If empty, any status update for the order will be accepted.
+func (c *BinanceWebSocketClient) WaitForOrderConfirmation(orderID string, timeout time.Duration, acceptedStatuses ...common.OrderStatus) (*common.Order, error) {
+	if orderID == "" {
+		return nil, fmt.Errorf("order ID is required")
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	// Create a channel to receive the order confirmation
+	confirmChan := make(chan common.Order, 1)
+	errChan := make(chan error, 1)
+
+	// Build a set of accepted statuses for fast lookup
+	acceptedSet := make(map[common.OrderStatus]bool)
+	for _, status := range acceptedStatuses {
+		acceptedSet[status] = true
+	}
+
+	// Get listen key and subscribe if not already subscribed
+	listenKey, err := c.getListenKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get listen key for order confirmation: %w", err)
+	}
+
+	if !c.IsConnected() {
+		if err := c.Connect(); err != nil {
+			return nil, fmt.Errorf("failed to connect WebSocket for order confirmation: %w", err)
+		}
+	}
+
+	streamName := listenKey
+
+	// Check if already subscribed
+	c.mu.RLock()
+	_, alreadySubscribed := c.subscriptions[streamName]
+	c.mu.RUnlock()
+
+	// Create the confirmation callback
+	confirmCallback := func(order common.Order) {
+		if order.ID == orderID {
+			// Check if the status is acceptable (or accept any if no filter specified)
+			if len(acceptedSet) == 0 || acceptedSet[order.Status] {
+				select {
+				case confirmChan <- order:
+					c.logger.Debugf("[%s] order %s confirmed with status: %s", binanceWSComponent, orderID, order.Status)
+				default:
+					// Channel already has a value, ignore duplicate
+				}
+			} else {
+				c.logger.Debugf("[%s] order %s received status %s, waiting for: %v", binanceWSComponent, orderID, order.Status, acceptedStatuses)
+			}
+		}
+	}
+
+	if !alreadySubscribed {
+		// Subscribe with our confirmation callback
+		sub := &BinanceUserDataSubscription{ListenKey: listenKey}
+		if err := c.batchSubscribe([]string{streamName}); err != nil {
+			return nil, fmt.Errorf("failed to subscribe for order confirmation: %w", err)
+		}
+		c.mu.Lock()
+		c.callbacks[streamName] = confirmCallback
+		c.subscriptions[streamName] = sub
+		c.mu.Unlock()
+		c.logger.Debugf("[%s] subscribed for order confirmation, waiting for order %s", binanceWSComponent, orderID)
+	} else {
+		// Already subscribed, wrap the existing callback to also check for our order
+		c.mu.Lock()
+		existingCallback := c.callbacks[streamName]
+		wrappedCallback := func(order common.Order) {
+			// Call the confirmation check
+			confirmCallback(order)
+			// Also call the existing callback if it's an order callback
+			if existingCb, ok := existingCallback.(func(common.Order)); ok {
+				existingCb(order)
+			}
+		}
+		c.callbacks[streamName] = wrappedCallback
+		c.mu.Unlock()
+		c.logger.Debugf("[%s] added confirmation listener for order %s to existing subscription", binanceWSComponent, orderID)
+	}
+
+	// Wait for confirmation or timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	select {
+	case order := <-confirmChan:
+		return &order, nil
+	case err := <-errChan:
+		return nil, err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("order %s confirmation timeout after %s (no websocket status received)", orderID, timeout)
+	}
 }
 
 // getListenKey retrieves a listen key for user data streams.
