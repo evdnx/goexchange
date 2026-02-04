@@ -1373,7 +1373,11 @@ func (c *BinanceClient) ConvertDustToAsset(assets []string, targetAsset string) 
 	if len(deduped) == 0 {
 		return nil, fmt.Errorf("no valid assets provided for dust conversion")
 	}
-	params.Add("asset", strings.Join(deduped, ","))
+	// Binance expects ARRAY parameters as multiple values with the same key
+	// (e.g., asset=BTC&asset=ETH), not comma-separated (asset=BTC,ETH)
+	for _, asset := range deduped {
+		params.Add("asset", asset)
+	}
 	params = c.addSignature(params)
 
 	endpoint := fmt.Sprintf("%s/asset/dust-convert/convert", c.sapiPath("v1"))
