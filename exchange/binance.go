@@ -40,6 +40,10 @@ type BinanceClient struct {
 	wsURL          string
 	isTestnet      bool
 	metrics        *metrics.Metrics
+
+	// Server time synchronization
+	timeOffset   int64 // Difference between local time and server time in milliseconds
+	timeOffsetMu sync.RWMutex
 }
 
 // BinanceResponse represents a generic Binance API response
@@ -172,7 +176,10 @@ const (
 	StreamBookTicker BinanceStreamType = "bookTicker"
 )
 
-const binanceHTTPTimeout = 10 * time.Second
+const binanceHTTPTimeout = 15 * time.Second // Increased from 10s to 15s for better resilience
+
+// Default recvWindow for signed requests (increased from 5000ms to handle network latency better)
+const defaultRecvWindow = 10000
 
 // taggedCoinsCache caches the list of Seed and Monitoring tagged coins
 // to avoid excessive scraping. Cache expires after 24 hours.
@@ -227,7 +234,59 @@ func NewBinanceClient(apiKey, apiSecret string, testnet bool, metrics *metrics.M
 
 	client.httpClient = createBinanceHTTPClient(apiKey, metrics)
 	client.wsClient = NewBinanceWebSocketClient(wsURL, baseURL, apiKey, apiSecret, client.httpClient)
+
+	// Initialize server time offset synchronization
+	if err := client.SyncServerTime(); err != nil {
+		// Log warning but don't fail - will retry on API calls
+		// The offset will be 0 which uses local time
+		_ = err // Intentionally ignore error during construction
+	}
+
 	return client
+}
+
+// SyncServerTime synchronizes the local timestamp with Binance server time.
+// This helps prevent -1021 errors ("Timestamp for this request is outside of the recvWindow").
+// Call this periodically (e.g., every 5-10 minutes) for long-running applications.
+func (c *BinanceClient) SyncServerTime() error {
+	// Call the public server time endpoint (no signature required)
+	endpoint := fmt.Sprintf("%s/time", c.apiPath("v3"))
+
+	localBefore := time.Now().UnixNano() / int64(time.Millisecond)
+	response, err := c.doGet(endpoint)
+	localAfter := time.Now().UnixNano() / int64(time.Millisecond)
+
+	if err != nil {
+		return fmt.Errorf("failed to get server time: %w", err)
+	}
+
+	var serverTimeResponse struct {
+		ServerTime int64 `json:"serverTime"`
+	}
+	if err := json.Unmarshal(response, &serverTimeResponse); err != nil {
+		return fmt.Errorf("failed to parse server time: %w", err)
+	}
+
+	// Calculate network latency and adjust
+	networkLatency := (localAfter - localBefore) / 2
+	estimatedLocalTime := localBefore + networkLatency
+
+	// Calculate offset: positive means server is ahead, negative means server is behind
+	offset := serverTimeResponse.ServerTime - estimatedLocalTime
+
+	c.timeOffsetMu.Lock()
+	c.timeOffset = offset
+	c.timeOffsetMu.Unlock()
+
+	return nil
+}
+
+// GetTimeOffset returns the current server time offset in milliseconds.
+// Positive value means server time is ahead of local time.
+func (c *BinanceClient) GetTimeOffset() int64 {
+	c.timeOffsetMu.RLock()
+	defer c.timeOffsetMu.RUnlock()
+	return c.timeOffset
 }
 
 // createBinanceHTTPClient creates a configured HTTP client for Binance API
@@ -256,9 +315,9 @@ func (c *BinanceClient) getHeaders() map[string]string {
 }
 
 // addSignature adds timestamp, recvWindow, and HMAC SHA256 signature to request parameters.
-// Uses the default recvWindow of 5000 milliseconds.
+// Uses the default recvWindow of 10000 milliseconds (increased from 5000 for network latency).
 func (c *BinanceClient) addSignature(params url.Values) url.Values {
-	return c.addSignatureWithRecvWindow(params, 5000)
+	return c.addSignatureWithRecvWindow(params, defaultRecvWindow)
 }
 
 // addSignatureWithRecvWindow adds timestamp, recvWindow, and HMAC SHA256 signature to request parameters.
@@ -279,11 +338,15 @@ func (c *BinanceClient) addSignature(params url.Values) url.Values {
 // - HMAC signatures are case-insensitive (RSA and Ed25519 are case-sensitive)
 // - Signature is computed from params WITHOUT the signature field, then added to params
 func (c *BinanceClient) addSignatureWithRecvWindow(params url.Values, recvWindow int) url.Values {
-	// Add timestamp in milliseconds
-	timestamp := fmt.Sprintf("%d", time.Now().UnixNano()/int64(time.Millisecond))
+	// Get adjusted timestamp with server time offset
+	localTime := time.Now().UnixNano() / int64(time.Millisecond)
+	c.timeOffsetMu.RLock()
+	adjustedTime := localTime + c.timeOffset
+	c.timeOffsetMu.RUnlock()
+	timestamp := fmt.Sprintf("%d", adjustedTime)
 	params.Add("timestamp", timestamp)
 
-	// Add recvWindow if specified (defaults to 5000ms if not provided)
+	// Add recvWindow if specified (defaults to 10000ms if not provided)
 	// recvWindow supports up to 3 decimal places for microsecond precision
 	if recvWindow > 0 {
 		params.Add("recvWindow", strconv.Itoa(recvWindow))
