@@ -178,8 +178,12 @@ const (
 
 const binanceHTTPTimeout = 15 * time.Second // Increased from 10s to 15s for better resilience
 
-// Default recvWindow for signed requests (increased from 5000ms to handle network latency better)
-const defaultRecvWindow = 10000
+// Default recvWindow for signed requests. Binance allows up to 60000ms (60 seconds).
+// Increased from 10000ms to 30000ms to handle:
+// - Network latency variations
+// - System time drift between sync intervals
+// - High-latency network conditions
+const defaultRecvWindow = 30000
 
 // taggedCoinsCache caches the list of Seed and Monitoring tagged coins
 // to avoid excessive scraping. Cache expires after 24 hours.
