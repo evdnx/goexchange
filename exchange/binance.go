@@ -201,6 +201,22 @@ var globalTaggedCoinsCache = &taggedCoinsCache{
 	cacheDuration:   24 * time.Hour,
 }
 
+// tradingPairsCache caches the list of trading pairs to reduce API calls
+// Exchange info rarely changes, so 5 minute cache is reasonable
+type tradingPairsCache struct {
+	mu            sync.RWMutex
+	pairs         []common.TradingPair
+	filteredPairs []common.TradingPair // With Seed/Monitoring filtered
+	lastUpdate    time.Time
+	cacheDuration time.Duration
+}
+
+var globalTradingPairsCache = &tradingPairsCache{
+	pairs:         nil,
+	filteredPairs: nil,
+	cacheDuration: 5 * time.Minute,
+}
+
 // NewBinanceClient creates a new Binance client for spot and futures trading.
 // If apiKey or apiSecret are empty strings, they will be read from environment variables
 // BINANCE_API_KEY and BINANCE_API_SECRET respectively.
@@ -219,11 +235,14 @@ func NewBinanceClient(apiKey, apiSecret string, testnet bool, metrics *metrics.M
 	wsURL := "wss://stream.binance.com:9443/stream"
 
 	if testnet {
-		// For demo accounts, use demo-api.binance.com
+		// For demo accounts, use demo-api.binance.com for REST API (trading)
 		// Note: Demo environment may not support all endpoints (e.g., /order/test)
 		baseURL = "https://demo-api.binance.com/api"
 		futuresBaseURL = "https://testnet.binancefuture.com" // Prepend "/fapi" for USDT-M or "/dapi" for Coin-M in endpoints, e.g., futuresBaseURL + "/fapi/v1/ticker/price"
-		wsURL = "wss://demo-api.binance.com/stream"          // Combined stream endpoint for user data and market data
+		// IMPORTANT: The demo-api.binance.com does NOT support WebSocket streams (returns 404).
+		// Use production WebSocket streams for market data - they are public/read-only and work with demo trading.
+		// This allows real-time market data while trading on the demo account.
+		wsURL = "wss://stream.binance.com:9443/stream"
 	}
 
 	client := &BinanceClient{
@@ -470,6 +489,70 @@ func constructServicePath(baseURL, service, version string) string {
 		base = strings.TrimSuffix(base, "/sapi")
 	}
 	return fmt.Sprintf("%s/%s/%s", base, service, version)
+}
+
+// isStablecoinOrUnsuitable checks if a base asset is a stablecoin or otherwise unsuitable for scalping.
+// Stablecoins have near-zero volatility and are useless for scalping strategies.
+func isStablecoinOrUnsuitable(baseAsset string) bool {
+	upper := strings.ToUpper(baseAsset)
+
+	// USD Stablecoins - pegged to $1, no volatility
+	usdStablecoins := map[string]bool{
+		"USDC": true, "BUSD": true, "TUSD": true, "USDP": true, "DAI": true,
+		"FDUSD": true, "PYUSD": true, "USD1": true, "USDD": true, "GUSD": true,
+		"USTC": true, "UST": true, "RLUSD": true, "USDJ": true, "SUSD": true,
+		"LUSD": true, "FRAX": true, "CRVUSD": true, "GHO": true, "USDB": true,
+		"USDX": true, "CUSD": true, "DOLA": true, "MIM": true, "ZUSD": true,
+		"USDY": true, "USDZ": true,
+	}
+	if usdStablecoins[upper] {
+		return true
+	}
+
+	// Euro Stablecoins - pegged to €1
+	euroStablecoins := map[string]bool{
+		"EURC": true, "EURT": true, "EURI": true, "EURS": true,
+		"AGEUR": true, "CEUR": true, "SEUR": true,
+	}
+	if euroStablecoins[upper] {
+		return true
+	}
+
+	// Other fiat stablecoins
+	otherFiatStablecoins := map[string]bool{
+		"BIDR": true, "IDRT": true, "BRLA": true, "TRYB": true,
+		"JPYC": true, "XSGD": true, "XIDR": true, "GYEN": true,
+	}
+	if otherFiatStablecoins[upper] {
+		return true
+	}
+
+	// Wrapped/staked tokens that often have trading restrictions
+	wrappedTokens := map[string]bool{
+		"WBETH": true, "WBTC": true, "STETH": true, "RETH": true,
+		"CBETH": true, "WBETH2": true,
+	}
+	if wrappedTokens[upper] {
+		return true
+	}
+
+	// Very short names - often low liquidity or test tokens
+	if len(upper) == 1 {
+		return true // Single letter tokens like "U" are typically problematic
+	}
+	if len(upper) == 2 && !isKnownGoodTwoLetterToken(upper) {
+		return true // Two letter tokens except known good ones
+	}
+
+	return false
+}
+
+// isKnownGoodTwoLetterToken returns true for legitimate 2-letter token symbols
+func isKnownGoodTwoLetterToken(symbol string) bool {
+	knownGood := map[string]bool{
+		"OM": true, "SC": true, "ID": true, "IO": true,
+	}
+	return knownGood[symbol]
 }
 
 // convertToBinanceSymbol converts symbol format (e.g., "BTC/USDT" to "BTCUSDT")
@@ -1970,6 +2053,15 @@ func (c *BinanceClient) ClearTaggedCoinsCache() {
 	globalTaggedCoinsCache.lastUpdate = time.Time{} // Zero time forces refresh
 }
 
+// ClearTradingPairsCache clears the cached trading pairs, forcing a fresh fetch on next request
+func (c *BinanceClient) ClearTradingPairsCache() {
+	globalTradingPairsCache.mu.Lock()
+	defer globalTradingPairsCache.mu.Unlock()
+	globalTradingPairsCache.pairs = nil
+	globalTradingPairsCache.filteredPairs = nil
+	globalTradingPairsCache.lastUpdate = time.Time{} // Zero time forces refresh
+}
+
 // GetTradingPairs returns all available trading pairs
 func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 	return c.GetTradingPairsWithFilter(false)
@@ -1980,10 +2072,35 @@ func (c *BinanceClient) GetTradingPairs() ([]common.TradingPair, error) {
 // Always excludes tokens marked with "Seed" tag (high-risk tokens with potential total loss).
 // Uses web scraping to get the most up-to-date list of tagged coins, as Binance APIs don't include tag data.
 // filterSeedTokens: deprecated parameter, kept for backward compatibility. Seed tokens are always filtered.
+// Results are cached for 5 minutes to reduce API load and prevent timeouts.
 func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]common.TradingPair, error) {
+	logger := common.DefaultLogger()
+
+	// Check cache first
+	globalTradingPairsCache.mu.RLock()
+	cacheValid := time.Since(globalTradingPairsCache.lastUpdate) < globalTradingPairsCache.cacheDuration
+	cachedFiltered := globalTradingPairsCache.filteredPairs
+	globalTradingPairsCache.mu.RUnlock()
+
+	// Return cached result if still valid
+	if cacheValid && cachedFiltered != nil {
+		logger.Debugf("Using cached trading pairs (age: %v, count: %d)", time.Since(globalTradingPairsCache.lastUpdate), len(cachedFiltered))
+		// Return a copy to prevent modification
+		result := make([]common.TradingPair, len(cachedFiltered))
+		copy(result, cachedFiltered)
+		return result, nil
+	}
+
 	endpoint := fmt.Sprintf("%s/exchangeInfo", c.apiPath("v3"))
 	response, err := c.doGet(endpoint)
 	if err != nil {
+		// On error, try to return stale cache if available
+		if cachedFiltered != nil {
+			logger.Warnf("Failed to fetch exchange info, using stale cache: %v", err)
+			result := make([]common.TradingPair, len(cachedFiltered))
+			copy(result, cachedFiltered)
+			return result, nil
+		}
 		return nil, fmt.Errorf("failed to fetch exchange info: %w", err)
 	}
 
@@ -2005,7 +2122,6 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 	ctx := context.Background()
 	monitoringCoins, seedCoins, scrapeErr := c.getCachedTaggedCoins(ctx)
 
-	logger := common.DefaultLogger()
 	if scrapeErr != nil {
 		logger.Warnf("Failed to scrape tagged coins from web - Monitoring and Seed coins may not be filtered: %v", scrapeErr)
 	} else {
@@ -2023,10 +2139,18 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 	}
 
 	var tradingPairs []common.TradingPair
+	var unfilteredPairs []common.TradingPair
 	for _, symbol := range exchangeInfo.Symbols {
 		if symbol.Status != "TRADING" {
 			continue
 		}
+
+		pair := common.TradingPair{
+			Symbol:     symbol.Symbol,
+			BaseAsset:  symbol.BaseAsset,
+			QuoteAsset: symbol.QuoteAsset,
+		}
+		unfilteredPairs = append(unfilteredPairs, pair)
 
 		baseAsset := strings.ToUpper(symbol.BaseAsset)
 
@@ -2046,12 +2170,17 @@ func (c *BinanceClient) GetTradingPairsWithFilter(filterSeedTokens bool) ([]comm
 			}
 		}
 
-		tradingPairs = append(tradingPairs, common.TradingPair{
-			Symbol:     symbol.Symbol,
-			BaseAsset:  symbol.BaseAsset,
-			QuoteAsset: symbol.QuoteAsset,
-		})
+		tradingPairs = append(tradingPairs, pair)
 	}
+
+	// Update cache
+	globalTradingPairsCache.mu.Lock()
+	globalTradingPairsCache.pairs = unfilteredPairs
+	globalTradingPairsCache.filteredPairs = tradingPairs
+	globalTradingPairsCache.lastUpdate = time.Now()
+	globalTradingPairsCache.mu.Unlock()
+
+	logger.Debugf("Fetched and cached %d trading pairs (%d filtered)", len(tradingPairs), len(unfilteredPairs)-len(tradingPairs))
 
 	return tradingPairs, nil
 }
@@ -2223,10 +2352,17 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	}
 
 	// Filter pairs by quote asset and build symbol map
+	// Also filter out stablecoins and other unsuitable tokens
 	candidatePairs := make([]common.TradingPair, 0)
 	symbolMap := make(map[string]common.TradingPair)
+	stablecoinFiltered := 0
 	for _, pair := range tradingPairs {
 		if strings.EqualFold(pair.QuoteAsset, config.QuoteAsset) {
+			// Filter out stablecoins and unsuitable tokens
+			if isStablecoinOrUnsuitable(pair.BaseAsset) {
+				stablecoinFiltered++
+				continue
+			}
 			candidatePairs = append(candidatePairs, pair)
 			binanceSymbol := convertToBinanceSymbol(pair.Symbol)
 			symbolMap[binanceSymbol] = pair
@@ -2234,10 +2370,10 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	}
 
 	if len(candidatePairs) == 0 {
-		return nil, fmt.Errorf("no trading pairs found for quote asset %s", config.QuoteAsset)
+		return nil, fmt.Errorf("no trading pairs found for quote asset %s (stablecoin filtered: %d)", config.QuoteAsset, stablecoinFiltered)
 	}
 
-	logger.Debugf("FindScalpingCoins: Found %d candidate pairs for %s", len(candidatePairs), config.QuoteAsset)
+	logger.Debugf("FindScalpingCoins: Found %d candidate pairs for %s (stablecoin filtered: %d)", len(candidatePairs), config.QuoteAsset, stablecoinFiltered)
 
 	// PHASE 1: Batch fetch all 24h tickers in one API call
 	allTickers, err := c.getAllTickers24hr(ctx)
