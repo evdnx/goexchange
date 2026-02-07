@@ -544,6 +544,33 @@ func isStablecoinOrUnsuitable(baseAsset string) bool {
 		return true // Two letter tokens except known good ones
 	}
 
+	// Known memecoins, political tokens, and low-quality tokens unsuitable for scalping.
+	// These tokens have extreme volatility, thin order books, and flash-crash risk
+	// that blow through tight stop losses.
+	problematicTokens := map[string]bool{
+		// Memecoins / animal coins
+		"DOGE": false, "SHIB": false, // These are large-cap and liquid enough
+		"PEPE":  false, // Large-cap meme, liquid enough
+		"FLOKI": true, "BONK": true, "WIF": true, "BOME": true, "MEW": true,
+		"MEME": true, "TURBO": true, "BABYDOGE": true, "NEIRO": true,
+		"COQ": true, "MYRO": true, "SLERF": true, "BRETT": true,
+		"PORK": true, "MOG": true, "TOSHI": true,
+
+		// Political / social tokens
+		"TRUMP": true, "MAGA": true, "WLFI": true, "BODEN": true,
+		"MUBARAK": true,
+
+		// Pump/hype tokens
+		"PUMP": true, "BANANA": true, "BANANAS31": true,
+		"BREV": true, "PROVE": true, "ZAMA": true,
+
+		// Very new / unproven tokens with thin books
+		"SPK": true, "GPS": true,
+	}
+	if problematicTokens[upper] {
+		return true
+	}
+
 	return false
 }
 
@@ -2241,6 +2268,13 @@ type ScalpingConfig struct {
 	UptrendWeight float64
 	// StrongUptrendOnly tightens trend filters (24h, 6h, 1h, RS) to require clear upside.
 	StrongUptrendOnly bool
+	// ExcludedBaseAssets is a list of base asset symbols to exclude from selection.
+	// Useful for filtering out known problematic tokens (memecoins, low-liquidity, etc).
+	ExcludedBaseAssets []string
+	// MinUnitPrice is the minimum unit price in quote asset. Coins priced below this
+	// threshold are excluded because they have larger percentage gaps per tick.
+	// Default: 0 (disabled). Recommended: 0.01 for USDT pairs.
+	MinUnitPrice float64
 }
 
 // DefaultScalpingConfig returns the recommended configuration for scalping coin selection.
@@ -2266,6 +2300,7 @@ func DefaultScalpingConfig() ScalpingConfig {
 		TrendBiasWeight:        1.15, // Reward short-term upside/relative strength in scoring
 		UptrendWeight:          1.0,  // Moderate boost for aligned multi-timeframe uptrends
 		StrongUptrendOnly:      false,
+		MinUnitPrice:           0, // Disabled by default for backward compatibility
 	}
 }
 
@@ -2365,15 +2400,28 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	}
 
 	// Filter pairs by quote asset and build symbol map
-	// Also filter out stablecoins and other unsuitable tokens
+	// Also filter out stablecoins, memecoins, and other unsuitable tokens
 	candidatePairs := make([]common.TradingPair, 0)
 	symbolMap := make(map[string]common.TradingPair)
 	stablecoinFiltered := 0
+	excludedFiltered := 0
+
+	// Build excluded base asset set for O(1) lookup
+	excludedSet := make(map[string]bool, len(config.ExcludedBaseAssets))
+	for _, asset := range config.ExcludedBaseAssets {
+		excludedSet[strings.ToUpper(asset)] = true
+	}
+
 	for _, pair := range tradingPairs {
 		if strings.EqualFold(pair.QuoteAsset, config.QuoteAsset) {
 			// Filter out stablecoins and unsuitable tokens
 			if isStablecoinOrUnsuitable(pair.BaseAsset) {
 				stablecoinFiltered++
+				continue
+			}
+			// Filter out explicitly excluded base assets
+			if excludedSet[strings.ToUpper(pair.BaseAsset)] {
+				excludedFiltered++
 				continue
 			}
 			candidatePairs = append(candidatePairs, pair)
@@ -2383,10 +2431,10 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	}
 
 	if len(candidatePairs) == 0 {
-		return nil, fmt.Errorf("no trading pairs found for quote asset %s (stablecoin filtered: %d)", config.QuoteAsset, stablecoinFiltered)
+		return nil, fmt.Errorf("no trading pairs found for quote asset %s (stablecoin filtered: %d, excluded: %d)", config.QuoteAsset, stablecoinFiltered, excludedFiltered)
 	}
 
-	logger.Debugf("FindScalpingCoins: Found %d candidate pairs for %s (stablecoin filtered: %d)", len(candidatePairs), config.QuoteAsset, stablecoinFiltered)
+	logger.Debugf("FindScalpingCoins: Found %d candidate pairs for %s (stablecoin filtered: %d, excluded: %d)", len(candidatePairs), config.QuoteAsset, stablecoinFiltered, excludedFiltered)
 
 	// PHASE 1: Batch fetch all 24h tickers in one API call
 	allTickers, err := c.getAllTickers24hr(ctx)
@@ -2407,7 +2455,7 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 	}
 
 	candidates := make([]candidateData, 0)
-	var spreadFiltered, volumeFiltered, tradeFiltered, priceChangeFiltered int
+	var spreadFiltered, volumeFiltered, tradeFiltered, priceChangeFiltered, priceFiltered int
 
 	for _, ticker := range allTickers {
 		pair, exists := symbolMap[ticker.Symbol]
@@ -2429,6 +2477,13 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 		}
 		if askPrice < bidPrice {
 			continue // Invalid spread
+		}
+
+		// PRICE FLOOR: Skip micro-priced coins that have proportionally large tick gaps
+		// Low-priced coins (e.g. $0.001) can gap 1-2% on a single tick, blowing through tight stops.
+		if config.MinUnitPrice > 0 && lastPrice < config.MinUnitPrice {
+			priceFiltered++
+			continue
 		}
 
 		// Calculate spread
@@ -2472,12 +2527,12 @@ func (c *BinanceClient) FindScalpingCoinsWithConfig(config ScalpingConfig) ([]Sc
 		})
 	}
 
-	logger.Debugf("Phase 1: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d, remaining=%d",
-		spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, len(candidates))
+	logger.Debugf("Phase 1: priceFiltered=%d, spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d, remaining=%d",
+		priceFiltered, spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered, len(candidates))
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no candidates passed initial filters: spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d",
-			spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered)
+		return nil, fmt.Errorf("no candidates passed initial filters: priceFiltered=%d, spreadFiltered=%d, tradeFiltered=%d, volumeFiltered=%d, priceChangeFiltered=%d",
+			priceFiltered, spreadFiltered, tradeFiltered, volumeFiltered, priceChangeFiltered)
 	}
 
 	// Sort by spread (tightest spreads first) for priority in detailed analysis
