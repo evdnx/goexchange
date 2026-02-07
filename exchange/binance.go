@@ -927,6 +927,19 @@ func (c *BinanceClient) GetOrderBook(symbol string, depth int) (*models.OrderBoo
 	return orderBook, nil
 }
 
+// formatBinanceFloat formats a float value for Binance API parameters.
+// Uses 8 decimal places (Binance's maximum precision) and trims trailing zeros
+// to prevent floating-point noise (e.g., 0.30000000000000004) from causing
+// LOT_SIZE or PRICE_FILTER rejections.
+func formatBinanceFloat(value float64) string {
+	s := strconv.FormatFloat(value, 'f', 8, 64)
+	if strings.Contains(s, ".") {
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimRight(s, ".")
+	}
+	return s
+}
+
 // CreateOrder places a spot market order.
 // Use test=true to validate the order without placing it (uses /api/v3/order/test endpoint).
 // recvWindow specifies the receive window in milliseconds (default: 5000).
@@ -973,7 +986,7 @@ func (c *BinanceClient) CreateOrderAdvanced(symbol string, side common.OrderSide
 		if price <= 0 {
 			return nil, fmt.Errorf("price is required for limit orders")
 		}
-		params.Add("price", strconv.FormatFloat(price, 'f', -1, 64))
+		params.Add("price", formatBinanceFloat(price))
 	}
 
 	// For MARKET orders:
@@ -983,14 +996,14 @@ func (c *BinanceClient) CreateOrderAdvanced(symbol string, side common.OrderSide
 
 	if isMarketBuy && quoteOrderQty > 0 {
 		// Market buy with fixed quote amount (e.g., buy $100 worth of BTC)
-		params.Add("quoteOrderQty", strconv.FormatFloat(quoteOrderQty, 'f', -1, 64))
+		params.Add("quoteOrderQty", formatBinanceFloat(quoteOrderQty))
 	} else {
 		// Use quantity (base asset amount)
 		quantity := amount
 		if quantity <= 0 {
 			return nil, fmt.Errorf("order quantity must be greater than 0")
 		}
-		params.Add("quantity", strconv.FormatFloat(quantity, 'f', -1, 64))
+		params.Add("quantity", formatBinanceFloat(quantity))
 	}
 
 	// Add custom client order ID if provided
@@ -1168,10 +1181,10 @@ func (c *BinanceClient) PlaceFuturesOrder(order FuturesOrder) (string, error) {
 	if quantity <= 0 {
 		return "", fmt.Errorf("order quantity must be greater than 0")
 	}
-	params.Add("quantity", strconv.FormatFloat(quantity, 'f', -1, 64))
+	params.Add("quantity", formatBinanceFloat(quantity))
 
 	if order.Price > 0 {
-		params.Add("price", strconv.FormatFloat(order.Price, 'f', -1, 64))
+		params.Add("price", formatBinanceFloat(order.Price))
 	}
 
 	params.Add("reduceOnly", strconv.FormatBool(order.ReduceOnly))
