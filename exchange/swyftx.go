@@ -2582,6 +2582,125 @@ func (c *SwyftxClient) ResolveSymbol(symbol string) (map[string]interface{}, err
 	return resp, nil
 }
 
+// SwyftxAssetPrice contains buy/sell prices for an asset (denominated in AUD).
+type SwyftxAssetPrice struct {
+	Code      string  // Asset code (e.g., "BTC")
+	ID        int     // Swyftx asset ID
+	BuyPrice  float64 // Ask price in AUD (what you pay to buy this asset)
+	SellPrice float64 // Bid price in AUD (what you receive selling this asset)
+	Volume24H float64 // 24-hour trading volume
+}
+
+// GetAllAssetPrices fetches basic market info (buy/sell prices in AUD) for all active
+// secondary assets. This is used for efficient triangular arbitrage scanning where we
+// need bid/ask prices for all pairs. Returns a map keyed by uppercase asset code.
+//
+// The method fetches prices concurrently (up to 10 workers) with rate limiting to avoid
+// Swyftx API throttling. Inactive assets (delisting, buy disabled) are skipped.
+func (c *SwyftxClient) GetAllAssetPrices() (map[string]SwyftxAssetPrice, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	if err := c.ensureAssets(ctx); err != nil {
+		return nil, fmt.Errorf("swyftx: failed to load assets: %w", err)
+	}
+
+	// Collect all active secondary asset codes
+	c.assetMu.RLock()
+	type assetInfo struct {
+		code string
+		id   int
+	}
+	var assets []assetInfo
+	for code, asset := range c.assets {
+		if bool(asset.Secondary) && !bool(asset.Delisting) && !bool(asset.BuyDisabled) {
+			assets = append(assets, assetInfo{code: code, id: asset.ID})
+		}
+	}
+	c.assetMu.RUnlock()
+
+	if len(assets) == 0 {
+		return nil, fmt.Errorf("swyftx: no active assets found")
+	}
+
+	result := make(map[string]SwyftxAssetPrice, len(assets))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Use a semaphore for concurrency limiting (10 workers)
+	sem := make(chan struct{}, 10)
+
+	// Rate limiter: 50ms between requests = ~20 requests/second
+	rateLimiter := time.NewTicker(50 * time.Millisecond)
+	defer rateLimiter.Stop()
+
+	for _, a := range assets {
+		select {
+		case <-ctx.Done():
+			break
+		case <-rateLimiter.C:
+		}
+
+		wg.Add(1)
+		sem <- struct{}{} // Acquire semaphore
+		go func(a assetInfo) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release semaphore
+
+			info, err := c.getBasicMarketInfo(ctx, a.code)
+			if err != nil {
+				return // Skip assets that fail
+			}
+
+			buyPrice := parseStringFloat(info.Buy)
+			sellPrice := parseStringFloat(info.Sell)
+			if buyPrice <= 0 && sellPrice <= 0 {
+				return // Skip assets with no valid prices
+			}
+
+			mu.Lock()
+			result[strings.ToUpper(a.code)] = SwyftxAssetPrice{
+				Code:      strings.ToUpper(a.code),
+				ID:        a.id,
+				BuyPrice:  buyPrice,
+				SellPrice: sellPrice,
+				Volume24H: info.Volume24H,
+			}
+			mu.Unlock()
+		}(a)
+	}
+
+	wg.Wait()
+
+	if len(result) == 0 {
+		return nil, fmt.Errorf("swyftx: failed to fetch prices for any assets")
+	}
+
+	return result, nil
+}
+
+// GetPrimaryAssets returns the primary (quote) asset codes on Swyftx (e.g., "AUD", "BTC").
+// These are the assets that serve as quote currencies for trading pairs.
+func (c *SwyftxClient) GetPrimaryAssets() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := c.ensureAssets(ctx); err != nil {
+		return nil, err
+	}
+
+	c.assetMu.RLock()
+	defer c.assetMu.RUnlock()
+
+	var primaries []string
+	for code, asset := range c.assets {
+		if asset.Primary() && bool(asset.DepositEnabled) && bool(asset.WithdrawEnabled) {
+			primaries = append(primaries, strings.ToUpper(code))
+		}
+	}
+	return primaries, nil
+}
+
 // Logout logs out the current session.
 // Based on Swyftx OpenAPI spec: POST /auth/logout
 func (c *SwyftxClient) Logout() error {
