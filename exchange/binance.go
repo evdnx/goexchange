@@ -1415,6 +1415,106 @@ func (c *BinanceClient) GetBalances() (map[string]*common.Balance, error) {
 	return balances, nil
 }
 
+// GetFuturesBalance returns the USDT-M futures balance for a specific asset
+func (c *BinanceClient) GetFuturesBalance(asset string) (*common.Balance, error) {
+	balances, err := c.GetFuturesBalances()
+	if err != nil {
+		return nil, err
+	}
+	if bal, ok := balances[asset]; ok {
+		return bal, nil
+	}
+	// Return zero balance if asset not found
+	return &common.Balance{Asset: asset, Free: "0", Locked: "0"}, nil
+}
+
+// GetFuturesBalances returns all USDT-M futures account balances
+func (c *BinanceClient) GetFuturesBalances() (map[string]*common.Balance, error) {
+	endpoint := fmt.Sprintf("%s/fapi/v2/balance", c.futuresBaseURL)
+	params := url.Values{}
+	params = c.addSignature(params)
+
+	response, err := c.doGet(endpoint + "?" + params.Encode())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get futures balance: %w", err)
+	}
+
+	var futuresBalances []struct {
+		Asset              string `json:"asset"`
+		Balance            string `json:"balance"`
+		CrossWalletBalance string `json:"crossWalletBalance"`
+		AvailableBalance   string `json:"availableBalance"`
+		MaxWithdrawAmount  string `json:"maxWithdrawAmount"`
+		CrossUnPnl         string `json:"crossUnPnl"`
+		UpdateTime         int64  `json:"updateTime"`
+	}
+
+	if err := json.Unmarshal(response, &futuresBalances); err != nil {
+		// Check if it's an error response
+		var errResp BinanceResponse
+		if jsonErr := json.Unmarshal(response, &errResp); jsonErr == nil && errResp.Code != 0 {
+			return nil, fmt.Errorf("futures balance error: %s", errResp.Message)
+		}
+		return nil, fmt.Errorf("failed to parse futures balance: %w", err)
+	}
+
+	balances := make(map[string]*common.Balance)
+	for _, bal := range futuresBalances {
+		balances[bal.Asset] = &common.Balance{
+			Asset:  bal.Asset,
+			Free:   bal.AvailableBalance,
+			Locked: "0", // Futures doesn't have locked in the same way
+		}
+	}
+
+	return balances, nil
+}
+
+// TransferSpotToFutures transfers assets from spot wallet to USDT-M futures wallet
+// Uses Binance Universal Transfer API endpoint
+func (c *BinanceClient) TransferSpotToFutures(asset string, amount float64) error {
+	return c.universalTransfer(asset, amount, "MAIN_UMFUTURE")
+}
+
+// TransferFuturesToSpot transfers assets from USDT-M futures wallet to spot wallet
+func (c *BinanceClient) TransferFuturesToSpot(asset string, amount float64) error {
+	return c.universalTransfer(asset, amount, "UMFUTURE_MAIN")
+}
+
+// universalTransfer performs a transfer between Binance wallets
+// type can be: MAIN_UMFUTURE (spot to USDT-M futures), UMFUTURE_MAIN (USDT-M futures to spot), etc.
+func (c *BinanceClient) universalTransfer(asset string, amount float64, transferType string) error {
+	endpoint := fmt.Sprintf("%s/asset/transfer", c.apiPath("v1"))
+
+	params := url.Values{}
+	params.Add("type", transferType)
+	params.Add("asset", asset)
+	params.Add("amount", formatBinanceFloat(amount))
+	params = c.addSignature(params)
+
+	response, err := c.doPost(endpoint, []byte(params.Encode()), map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to transfer %s: %w", transferType, err)
+	}
+
+	var transferResp struct {
+		TranID int64 `json:"tranId"`
+		BinanceResponse
+	}
+
+	if err := json.Unmarshal(response, &transferResp); err != nil {
+		return fmt.Errorf("failed to parse transfer response: %w", err)
+	}
+
+	if transferResp.Code != 0 {
+		return fmt.Errorf("transfer error: %s", transferResp.Message)
+	}
+
+	return nil
+}
+
 // GetSpotPositions returns all open spot positions, excluding dust and non-tradeable positions
 func (c *BinanceClient) GetSpotPositions() ([]SpotPosition, error) {
 	// Get all balances
