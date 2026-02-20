@@ -4142,6 +4142,7 @@ func (c *BinanceWebSocketClient) replaceClient(url string) {
 		gowscl.WithMaxReconnect(60*time.Second),
 		gowscl.WithReconnectFactor(2.0),
 		gowscl.WithReconnectJitter(0.1),
+		gowscl.WithMessageQueueSize(1000), // Increased from default 100 to handle many symbols
 		gowscl.WithOnMessage(func(data []byte, typ gowscl.MessageType) {
 			if err := c.HandleMessage(data); err != nil {
 				c.logger.Warnf("[%s] websocket message handling failed: %v", binanceWSComponent, err)
