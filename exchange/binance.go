@@ -238,7 +238,9 @@ func NewBinanceClient(apiKey, apiSecret string, testnet bool, metrics *metrics.M
 		// For demo accounts, use demo-api.binance.com for REST API (trading)
 		// Note: Demo environment may not support all endpoints (e.g., /order/test)
 		baseURL = "https://demo-api.binance.com/api"
-		futuresBaseURL = "https://testnet.binancefuture.com" // Prepend "/fapi" for USDT-M or "/dapi" for Coin-M in endpoints, e.g., futuresBaseURL + "/fapi/v1/ticker/price"
+		// Binance demo futures endpoint (unified demo trading environment)
+		// Prepend "/fapi" for USDT-M or "/dapi" for Coin-M in endpoints
+		futuresBaseURL = "https://demo-fapi.binance.com"
 		// IMPORTANT: The demo-api.binance.com does NOT support WebSocket streams (returns 404).
 		// Use production WebSocket streams for market data - they are public/read-only and work with demo trading.
 		// This allows real-time market data while trading on the demo account.
