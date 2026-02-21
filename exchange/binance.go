@@ -1484,7 +1484,8 @@ func (c *BinanceClient) TransferFuturesToSpot(asset string, amount float64) erro
 // universalTransfer performs a transfer between Binance wallets
 // type can be: MAIN_UMFUTURE (spot to USDT-M futures), UMFUTURE_MAIN (USDT-M futures to spot), etc.
 func (c *BinanceClient) universalTransfer(asset string, amount float64, transferType string) error {
-	endpoint := fmt.Sprintf("%s/asset/transfer", c.apiPath("v1"))
+	// Use SAPI endpoint - Universal Transfer is at /sapi/v1/asset/transfer
+	endpoint := fmt.Sprintf("%s/asset/transfer", c.sapiPath("v1"))
 
 	params := url.Values{}
 	params.Add("type", transferType)
