@@ -11,13 +11,13 @@ import (
 	"github.com/evdnx/goexchange/common"
 	"github.com/evdnx/goexchange/models"
 	"github.com/evdnx/golog"
-	"nhooyr.io/websocket"
+	"github.com/evdnx/gowscl"
 )
 
 // IRWebSocketClient manages a websocket connection to Independent Reserve
 // and handles subscriptions and message dispatch.
 type IRWebSocketClient struct {
-	conn   *websocket.Conn
+	ws     *gowscl.Client
 	url    string
 	logger *golog.Logger
 	mu     sync.RWMutex
@@ -49,18 +49,67 @@ func NewIRWebSocketClient(baseURL string, logger *golog.Logger) *IRWebSocketClie
 
 // Connect establishes the websocket connection.
 func (c *IRWebSocketClient) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
 	if c.connected {
+		c.mu.RUnlock()
 		return nil
 	}
-	conn, _, err := websocket.Dial(c.ctx, c.url, nil)
-	if err != nil {
+	c.mu.RUnlock()
+
+	if c.logger == nil {
+		c.logger = common.DefaultLogger()
+	}
+
+	ws := gowscl.NewClient(
+		c.url,
+		gowscl.WithLogger(c.logger),
+		gowscl.WithInitialReconnect(1*time.Second),
+		gowscl.WithMaxReconnect(60*time.Second),
+		gowscl.WithReconnectFactor(2.0),
+		gowscl.WithReconnectJitter(0.1),
+		gowscl.WithMessageQueueSize(1000),
+		gowscl.WithOnMessage(func(data []byte, _ gowscl.MessageType) {
+			if err := c.processRawMessage(data); err != nil {
+				c.logger.Warnf("IR WS message handling failed: %v", err)
+			}
+		}),
+		gowscl.WithOnOpen(func() {
+			c.mu.Lock()
+			c.connected = true
+			// restore subscriptions
+			channels := make([]string, 0, len(c.subscribed))
+			for ch := range c.subscribed {
+				channels = append(channels, ch)
+			}
+			c.mu.Unlock()
+			if len(channels) > 0 {
+				msg := map[string]interface{}{"Event": "Subscribe", "Data": channels}
+				c.mu.RLock()
+				if c.ws != nil {
+					_ = c.ws.SendJSON(msg)
+				}
+				c.mu.RUnlock()
+			}
+		}),
+		gowscl.WithOnClose(func() {
+			c.mu.Lock()
+			c.connected = false
+			c.mu.Unlock()
+		}),
+		gowscl.WithOnError(func(err error) {
+			if err != nil {
+				c.logger.Warnf("IR WS error: %v", err)
+			}
+		}),
+	)
+
+	c.mu.Lock()
+	c.ws = ws
+	c.mu.Unlock()
+
+	if err := c.ws.Connect(); err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
-	c.conn = conn
-	c.connected = true
-	go c.readLoop()
 	return nil
 }
 
@@ -73,14 +122,13 @@ func (c *IRWebSocketClient) Subscribe(channels []string, handler func([]byte)) e
 		"Event": "Subscribe",
 		"Data":  channels,
 	}
-	b, _ := json.Marshal(msg)
 	c.mu.Lock()
 	for _, ch := range channels {
 		c.subs[ch] = handler
 		c.subscribed[ch] = true
 	}
 	c.mu.Unlock()
-	return c.conn.Write(c.ctx, websocket.MessageText, b)
+	return c.ws.SendJSON(msg)
 }
 
 // Unsubscribe unsubscribes from one or more channels.
@@ -89,38 +137,16 @@ func (c *IRWebSocketClient) Unsubscribe(channels []string) error {
 		"Event": "Unsubscribe",
 		"Data":  channels,
 	}
-	b, _ := json.Marshal(msg)
 	c.mu.Lock()
 	for _, ch := range channels {
 		delete(c.subs, ch)
 		delete(c.subscribed, ch)
 	}
 	c.mu.Unlock()
-	return c.conn.Write(c.ctx, websocket.MessageText, b)
+	return c.ws.SendJSON(msg)
 }
 
 // readLoop reads messages and dispatches to handlers.
-func (c *IRWebSocketClient) readLoop() {
-	for {
-		_, data, err := c.conn.Read(c.ctx)
-		if err != nil {
-			c.logger.Warnf("IR WS read error: %v", err)
-			// attempt reconnect asynchronously
-			c.Close()
-			c.attemptReconnect()
-			return
-		}
-		var msg map[string]interface{}
-		if err := json.Unmarshal(data, &msg); err != nil {
-			c.logger.Warnf("IR WS invalid JSON: %v", err)
-			continue
-		}
-		if err := c.processRawMessage(data); err != nil {
-			c.logger.Warnf("IR WS process message error: %v", err)
-		}
-	}
-}
-
 // processRawMessage parses a raw websocket message and dispatches to handlers.
 // This is separated for testability.
 func (c *IRWebSocketClient) processRawMessage(data []byte) error {
@@ -173,42 +199,7 @@ func (c *IRWebSocketClient) processRawMessage(data []byte) error {
 	}
 }
 
-// attemptReconnect tries to reconnect and resubscribe channels with backoff
-func (c *IRWebSocketClient) attemptReconnect() {
-	go func() {
-		backoff := time.Second
-		for {
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
-			}
-			c.logger.Infof("attempting IR WS reconnect")
-			err := c.Connect()
-			if err == nil {
-				// resubscribe channels
-				c.mu.RLock()
-				channels := make([]string, 0, len(c.subscribed))
-				for ch := range c.subscribed {
-					channels = append(channels, ch)
-				}
-				c.mu.RUnlock()
-				if len(channels) > 0 {
-					msg := map[string]interface{}{"Event": "Subscribe", "Data": channels}
-					b, _ := json.Marshal(msg)
-					_ = c.conn.Write(c.ctx, websocket.MessageText, b)
-				}
-				return
-			}
-			c.logger.Warnf("IR WS reconnect failed: %v; retrying in %v", err, backoff)
-			time.Sleep(backoff)
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-		}
-	}()
-}
+// gowscl handles reconnection automatically; resubscribe is performed on OnOpen.
 
 // IRRawMessage is the common websocket envelope
 type IRRawMessage struct {
@@ -387,8 +378,8 @@ func (c *IRWebSocketClient) SubscribeTickerTrades(cryptoPrimary string, handler 
 func (c *IRWebSocketClient) Close() {
 	c.cancel()
 	c.mu.Lock()
-	if c.conn != nil {
-		_ = c.conn.Close(websocket.StatusNormalClosure, "closing")
+	if c.ws != nil {
+		c.ws.Close()
 	}
 	c.connected = false
 	c.mu.Unlock()

@@ -16,7 +16,7 @@ Go clients for trading and market data across Binance, Coinbase, and Swyftx. The
 go get github.com/evdnx/goexchange
 ```
 
-Requires Go 1.25 or newer.
+Requires go 1.26 or newer.
 
 ## Quick start
 
