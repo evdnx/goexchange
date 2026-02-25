@@ -51,6 +51,9 @@ type IndependentReserveClient struct {
 	pairsFetched   time.Time
 	primaryCodes   []string
 	secondaryCodes []string
+
+	// WebSocket client for streaming
+	wsClient *IRWebSocketClient
 }
 
 // irMarketSummary represents the market summary response from Independent Reserve.
@@ -247,7 +250,52 @@ func NewIndependentReserveClient(apiKey, apiSecret string, testnet bool, metrics
 		httpTimeout: irHTTPTimeout,
 	}
 	client.httpClient = createIRHTTPClient(metricsClient)
+	// WebSocket endpoint: wss://websockets.independentreserve.com
+	wsURL := "wss://websockets.independentreserve.com"
+	client.wsClient = NewIRWebSocketClient(wsURL, client.logger)
 	return client
+}
+
+// SubscribeToWebSocket subscribes to IR WebSocket channels (e.g., orderbook-xbt, ticker-xbt)
+func (c *IndependentReserveClient) SubscribeToWebSocket(channels []string, handler func([]byte)) error {
+	if c.wsClient == nil {
+		return fmt.Errorf("websocket client not initialized")
+	}
+	return c.wsClient.Subscribe(channels, handler)
+}
+
+// UnsubscribeFromWebSocket unsubscribes from IR WebSocket channels
+func (c *IndependentReserveClient) UnsubscribeFromWebSocket(channels []string) error {
+	if c.wsClient == nil {
+		return fmt.Errorf("websocket client not initialized")
+	}
+	return c.wsClient.Unsubscribe(channels)
+}
+
+// CloseWebSocket closes the IR WebSocket connection
+func (c *IndependentReserveClient) CloseWebSocket() {
+	if c.wsClient != nil {
+		c.wsClient.Close()
+	}
+}
+
+// SubscribeOrderBook subscribes to IR orderbook events for the given symbol (e.g., "BTC/AUD").
+// Handler receives typed OrderEvent structs.
+func (c *IndependentReserveClient) SubscribeOrderBook(symbol string, handler func(OrderEvent)) error {
+	primary, _ := parseIRSymbol(symbol)
+	if primary == "" {
+		return fmt.Errorf("invalid symbol: %s", symbol)
+	}
+	return c.wsClient.SubscribeOrderBook(primary, handler)
+}
+
+// SubscribeTickerTrades subscribes to ticker trade events for the given symbol (e.g., "BTC/AUD").
+func (c *IndependentReserveClient) SubscribeTickerTrades(symbol string, handler func(TradeEvent)) error {
+	primary, _ := parseIRSymbol(symbol)
+	if primary == "" {
+		return fmt.Errorf("invalid symbol: %s", symbol)
+	}
+	return c.wsClient.SubscribeTickerTrades(primary, handler)
 }
 
 func createIRHTTPClient(metricsClient *metrics.Metrics) *gohttpcl.Client {

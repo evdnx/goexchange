@@ -4,10 +4,12 @@ go 1.25
 
 require (
 	github.com/evdnx/gohttpcl v1.0.5
-	github.com/evdnx/golog v1.0.7
+	github.com/evdnx/golog v1.0.9
 	github.com/evdnx/gotrademetrics v1.0.1
 	github.com/evdnx/gowscl v1.0.4
 )
+
+require nhooyr.io/websocket v1.8.17 // indirect
 
 require (
 	cloud.google.com/go v0.123.0 // indirect

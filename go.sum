@@ -31,6 +31,8 @@ github.com/evdnx/gohttpcl v1.0.5 h1:u+gQ2bW+Iyw9kOXRvn6/r61L0i+N7+Pc3ELYKR7X1DU=
 github.com/evdnx/gohttpcl v1.0.5/go.mod h1:eCwsogVaCMcIvE9BsluURldSbqMmyejtE4jUTs52QoE=
 github.com/evdnx/golog v1.0.7 h1:GPlS6sKiRu4Z+3iy44Wd8K015SdVynYMpwsNeUyybrI=
 github.com/evdnx/golog v1.0.7/go.mod h1:NxFgTjdQhLJhQgbjJgofMJ0Yv8evu8L9f2IxmNPY8JA=
+github.com/evdnx/golog v1.0.9 h1:TNNfGiHgAr2czOQFVRrUWIuxW8h6v7KXKsjY325d0S4=
+github.com/evdnx/golog v1.0.9/go.mod h1:NxFgTjdQhLJhQgbjJgofMJ0Yv8evu8L9f2IxmNPY8JA=
 github.com/evdnx/gotrademetrics v1.0.1 h1:L88DwfHFGidz1kmKSXiwd7V71Opd5mT2a23fyUyZqWE=
 github.com/evdnx/gotrademetrics v1.0.1/go.mod h1:NT+Bvp2MZR85DAXPf2MW8sLv+fA+6fS9TyHfFXl5T74=
 github.com/evdnx/gowscl v1.0.4 h1:b/avGPbW4x5tb6smzJCTcvYZpJLBsN5kFkhJLKl2+p8=
@@ -145,3 +147,5 @@ gopkg.in/natefinch/lumberjack.v2 v2.2.1 h1:bBRl1b0OH9s/DuPhuXpNl+VtCaJXFZ5/uEFST
 gopkg.in/natefinch/lumberjack.v2 v2.2.1/go.mod h1:YD8tP3GAjkrDg1eZH7EGmyESg/lsYskCTPBJVb9jqSc=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+nhooyr.io/websocket v1.8.17 h1:KEVeLJkUywCKVsnLIDlD/5gtayKp8VoCkksHCGGfT9Y=
+nhooyr.io/websocket v1.8.17/go.mod h1:rN9OFWIUwuxg4fR5tELlYC04bXYowCP9GX47ivo2l+c=
